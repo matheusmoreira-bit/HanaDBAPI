@@ -222,7 +222,12 @@ def resolve_schema_and_object_name(raw_object_name: str, schema: Optional[str], 
     explicit_schema = validate_identifier(schema, "schema")
     if "." in raw_object_name:
         raw_schema, raw_object_name = raw_object_name.split(".", 1)
-        explicit_schema = validate_identifier(raw_schema, "schema")
+        # If the client sent a leading dot like ".OBJECT_NAME" then raw_schema will be
+        # an empty string. Treat an empty raw_schema as "no explicit schema provided"
+        # instead of validating it (which would raise a 400). Only validate when
+        # raw_schema is non-empty.
+        if raw_schema != "":
+            explicit_schema = validate_identifier(raw_schema, "schema")
 
     object_name = validate_identifier(raw_object_name, "object")
     schema_name = explicit_schema or database.default_schema or app_settings.default_schema
@@ -357,6 +362,11 @@ def execute_query(
     statement = select(table).limit(applied_limit).offset(offset)
 
     for raw_key, raw_value in request.query_params.multi_items():
+        # Ignore empty query parameter names (e.g. when the URL ends with "?=")
+        # which would otherwise lead to a confusing 400 error later.
+        if not raw_key:
+            continue
+
         if raw_key in RESERVED_QUERY_PARAMS:
             continue
 

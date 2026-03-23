@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+hdbcli
+sqlalchemy-hana
+
+# Drivers opcionais para outros bancos:
+# psycopg[binary]
+# pymysql
+# pyodbc

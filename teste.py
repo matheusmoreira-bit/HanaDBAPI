@@ -1,14 +1,30 @@
-from hdbcli import dbapi
+import argparse
 
-print("Iniciando teste de conexão...")
-try:
-    conn = dbapi.connect(
-        address='10.160.11.2',
-        port=30015,
-        user='DBSAPB1',
-        password='lKd3b10BO*K1eNA2'
+from sqlalchemy import text
+
+from main import app_settings, registry
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Testa a conectividade com um dos bancos configurados.")
+    parser.add_argument(
+        "--database",
+        default=app_settings.default_database,
+        help="Nome do banco configurado em 'databases'.",
     )
-    print("Conectado com sucesso!")
-    conn.close()
-except Exception as e:
-    print(f"Erro na conexão: {e}")
+    args = parser.parse_args()
+
+    print(f"Iniciando teste de conexao com '{args.database}'...")
+    try:
+        engine = registry.get_engine(args.database)
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        print("Conectado com sucesso!")
+        return 0
+    except Exception as exc:
+        print(f"Erro na conexao: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

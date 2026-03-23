@@ -1,0 +1,5 @@
+HANA_CONFIG = {
+    'address': '10.160.11.2',
+    'port': 30015,
+    'user': 'DBSAPB1',
+    'password': 'lKd3b10BO*K1eNA2'

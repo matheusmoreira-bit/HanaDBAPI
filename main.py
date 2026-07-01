@@ -1,7 +1,12 @@
 import json
+import hashlib
+import hmac
 import logging
 import os
 import re
+import sqlite3
+import time as time_module
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -10,6 +15,7 @@ from typing import Any, Optional
 from urllib.parse import quote_plus, urlencode
 
 import uvicorn
+import requests
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import MetaData, Table, create_engine, inspect, select, text
@@ -23,6 +29,8 @@ logging.basicConfig(
 logger = logging.getLogger("hana-db-api")
 
 BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
+EXECUTION_LOG_DB = Path(os.getenv("HANA_DB_API_EXECUTION_LOG_DB", str(LOG_DIR / "executions.db"))).expanduser()
 CONFIG_CANDIDATES = [
     Path(os.getenv("HANA_DB_API_CONFIG", "")).expanduser() if os.getenv("HANA_DB_API_CONFIG") else None,
     BASE_DIR / "config.json",
@@ -30,7 +38,21 @@ CONFIG_CANDIDATES = [
 ]
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 SUPPORTED_OPERATORS = {"eq", "like", "ilike", "contains", "startswith", "endswith", "gt", "gte", "lt", "lte", "in"}
-RESERVED_QUERY_PARAMS = {"schema", "limit", "offset"}
+RESERVED_QUERY_PARAMS = {
+    "schema",
+    "limit",
+    "offset",
+    "DB",
+    "db",
+    "Table",
+    "table",
+    "DynamicToken",
+    "dynamic_token",
+    "SessionId",
+    "session_id",
+    "RouteId",
+    "route_id",
+}
 
 
 @dataclass(frozen=True)
@@ -42,6 +64,10 @@ class AppSettings:
     default_limit: int
     max_limit: int
     restart_delay_seconds: int
+    dynamic_token_secret: str
+    sap_service_layer_url: str
+    sap_service_layer_verify_ssl: bool
+    auth_timeout_seconds: int
 
 
 @dataclass(frozen=True)
@@ -75,6 +101,26 @@ def expand_env_placeholders(value: Any) -> Any:
     if isinstance(value, str):
         return re.sub(r"\$\{([^}]+)\}", lambda match: os.getenv(match.group(1), match.group(0)), value)
     return value
+
+
+def config_or_env(config: dict[str, Any], key: str, env_name: str, default: Any = "") -> Any:
+    env_value = os.getenv(env_name)
+    if env_value is not None:
+        return env_value
+    return config.get(key, default)
+
+
+def config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "sim"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "nao"}:
+        return False
+    return default
 
 
 def build_connection_url(config: dict[str, Any]) -> str:
@@ -135,6 +181,12 @@ def load_settings() -> tuple[AppSettings, dict[str, DatabaseConfig]]:
         default_limit=int(api_config.get("default_limit", 100)),
         max_limit=int(api_config.get("max_limit", 1000)),
         restart_delay_seconds=int(api_config.get("restart_delay_seconds", 5)),
+        dynamic_token_secret=str(config_or_env(api_config, "dynamic_token_secret", "HANA_QUERY_DYNAMIC_TOKEN_SECRET", "")),
+        sap_service_layer_url=str(config_or_env(api_config, "sap_service_layer_url", "SAP_B1_SERVICE_LAYER_URL", "")),
+        sap_service_layer_verify_ssl=config_bool(
+            config_or_env(api_config, "sap_service_layer_verify_ssl", "SAP_B1_SERVICE_LAYER_VERIFY_SSL", False)
+        ),
+        auth_timeout_seconds=int(config_or_env(api_config, "auth_timeout_seconds", "HANA_QUERY_AUTH_TIMEOUT_SECONDS", 10)),
     )
 
     databases: dict[str, DatabaseConfig] = {}
@@ -278,6 +330,81 @@ def parse_filter_key(raw_key: str) -> tuple[str, str]:
     return column_name, operator
 
 
+def get_request_value(request: Request, *names: str) -> Optional[str]:
+    for name in names:
+        value = request.headers.get(name)
+        if value:
+            return value
+        value = request.query_params.get(name)
+        if value:
+            return value
+    return None
+
+
+def service_layer_base_url() -> str:
+    base_url = app_settings.sap_service_layer_url.rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=503, detail="SAP_B1_SERVICE_LAYER_URL nao configurado.")
+    if not base_url.lower().endswith("/b1s/v1"):
+        base_url = f"{base_url}/b1s/v1"
+    return base_url
+
+
+def generate_dynamic_token(hour_block: int) -> str:
+    if not app_settings.dynamic_token_secret:
+        raise HTTPException(status_code=503, detail="HANA_QUERY_DYNAMIC_TOKEN_SECRET nao configurado.")
+    return hmac.new(
+        app_settings.dynamic_token_secret.encode("utf-8"),
+        str(hour_block).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def validate_dynamic_token(dynamic_token: Optional[str]) -> None:
+    if not dynamic_token:
+        raise HTTPException(status_code=401, detail="DynamicToken nao informado.")
+
+    current_block = int(time_module.time()) // 3600
+    valid_tokens = (
+        generate_dynamic_token(current_block),
+        generate_dynamic_token(current_block - 1),
+    )
+    received = dynamic_token.strip()
+    if not any(hmac.compare_digest(received, expected) for expected in valid_tokens):
+        raise HTTPException(status_code=401, detail="DynamicToken invalido.")
+
+
+def validate_sap_session(session_id: Optional[str], route_id: Optional[str] = None) -> None:
+    if not session_id:
+        raise HTTPException(status_code=401, detail="SessionId nao informado.")
+
+    cookie_parts = [f"B1SESSION={session_id.strip()}"]
+    if route_id:
+        cookie_parts.append(f"ROUTEID={route_id.strip()}")
+
+    try:
+        response = requests.get(
+            f"{service_layer_base_url()}/Users(10)",
+            headers={"Cookie": "; ".join(cookie_parts)},
+            timeout=app_settings.auth_timeout_seconds,
+            verify=app_settings.sap_service_layer_verify_ssl,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Falha ao validar SessionId no SAP.") from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=401, detail="SessionId invalido ou expirado.")
+
+
+def validate_query_access(request: Request) -> None:
+    dynamic_token = get_request_value(request, "DynamicToken", "dynamic_token", "dynamictoken")
+    session_id = get_request_value(request, "SessionId", "session_id", "sessionid")
+    route_id = get_request_value(request, "RouteId", "route_id", "routeid")
+
+    validate_dynamic_token(dynamic_token)
+    validate_sap_session(session_id, route_id=route_id)
+
+
 def parse_bool(value: str) -> bool:
     normalized = value.strip().lower()
     if normalized in {"1", "true", "t", "yes", "y", "sim"}:
@@ -347,62 +474,239 @@ def execute_query(
     limit: Optional[int],
     offset: int,
 ) -> dict[str, Any]:
-    database = registry.get_database(database_name)
-    schema_name, object_name = resolve_schema_and_object_name(raw_object_name, schema, database)
-    applied_limit = limit or app_settings.default_limit
-
-    if applied_limit > app_settings.max_limit:
-        raise HTTPException(
-            status_code=400,
-            detail=f"O limite maximo por consulta e {app_settings.max_limit}.",
-        )
-
-    table = load_table(database_name, schema_name, object_name)
-    column_map = {column.name.upper(): column for column in table.columns}
-    statement = select(table).limit(applied_limit).offset(offset)
-
-    for raw_key, raw_value in request.query_params.multi_items():
-        # Ignore empty query parameter names (e.g. when the URL ends with "?=")
-        # which would otherwise lead to a confusing 400 error later.
-        if not raw_key:
-            continue
-
-        if raw_key in RESERVED_QUERY_PARAMS:
-            continue
-
-        column_name, operator = parse_filter_key(raw_key)
-        column = column_map.get(column_name.upper())
-        if not column:
-            raise HTTPException(status_code=400, detail=f"Coluna '{column_name}' nao existe em '{object_name}'.")
-        statement = statement.where(build_predicate(column, operator, raw_value))
-
-    engine = registry.get_engine(database_name)
-    logger.info(
-        "Consultando banco=%s schema=%s objeto=%s limit=%s offset=%s",
-        database_name,
-        schema_name or "<default>",
-        object_name,
-        applied_limit,
-        offset,
-    )
+    execution_id = str(uuid.uuid4())
+    started_at = _utc_now_iso()
+    start_time = time_module.perf_counter()
+    schema_name: Optional[str] = None
+    object_name = raw_object_name
+    applied_limit: Optional[int] = None
+    filters: dict[str, list[str]] = {}
+    statement_preview: str | None = None
 
     try:
+        validate_query_access(request)
+        database = registry.get_database(database_name)
+        schema_name, object_name = resolve_schema_and_object_name(raw_object_name, schema, database)
+        applied_limit = None if limit is None else int(limit)
+
+        if applied_limit is not None and applied_limit > app_settings.max_limit:
+            raise HTTPException(
+                status_code=400,
+                detail=f"O limite maximo por consulta e {app_settings.max_limit}.",
+            )
+
+        table = load_table(database_name, schema_name, object_name)
+        column_map = {column.name.upper(): column for column in table.columns}
+        statement = select(table).offset(offset)
+        if applied_limit is not None:
+            statement = statement.limit(applied_limit)
+
+        for raw_key, raw_value in request.query_params.multi_items():
+            if not raw_key:
+                continue
+            if raw_key in RESERVED_QUERY_PARAMS:
+                continue
+            filters.setdefault(raw_key, []).append(raw_value)
+            column_name, operator = parse_filter_key(raw_key)
+            column = column_map.get(column_name.upper())
+            if column is None:
+                raise HTTPException(status_code=400, detail=f"Coluna '{column_name}' nao existe em '{object_name}'.")
+            statement = statement.where(build_predicate(column, operator, raw_value))
+
+        statement_preview = str(statement)[:4000]
+        engine = registry.get_engine(database_name)
+        logger.info(
+            "Consultando banco=%s schema=%s objeto=%s limit=%s offset=%s",
+            database_name,
+            schema_name or "<default>",
+            object_name,
+            applied_limit,
+            offset,
+        )
+
         with engine.connect() as connection:
             rows = connection.execute(statement).mappings().all()
+
+        duration_ms = int((time_module.perf_counter() - start_time) * 1000)
+        log_execution(
+            id=execution_id,
+            started_at=started_at,
+            finished_at=_utc_now_iso(),
+            duration_ms=duration_ms,
+            status="success",
+            database_name=database_name,
+            schema_name=schema_name,
+            object_name=object_name,
+            route=str(request.url.path),
+            method=request.method,
+            client_host=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            limit_value=applied_limit,
+            offset_value=offset,
+            row_count=len(rows),
+            filters_json=json.dumps(filters, ensure_ascii=False),
+            statement_preview=statement_preview,
+            error_type=None,
+            error_message=None,
+        )
+
+        return {
+            "success": True,
+            "execution_id": execution_id,
+            "database": database_name,
+            "schema": schema_name,
+            "object": object_name,
+            "count": len(rows),
+            "limit": applied_limit,
+            "offset": offset,
+            "data": jsonable_encoder(rows),
+        }
+    except HTTPException as exc:
+        duration_ms = int((time_module.perf_counter() - start_time) * 1000)
+        log_execution(
+            id=execution_id,
+            started_at=started_at,
+            finished_at=_utc_now_iso(),
+            duration_ms=duration_ms,
+            status="error",
+            database_name=database_name,
+            schema_name=schema_name,
+            object_name=object_name,
+            route=str(request.url.path),
+            method=request.method,
+            client_host=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            limit_value=applied_limit,
+            offset_value=offset,
+            row_count=0,
+            filters_json=json.dumps(filters, ensure_ascii=False),
+            statement_preview=statement_preview,
+            error_type="HTTPException",
+            error_message=str(exc.detail),
+        )
+        raise
     except SQLAlchemyError as exc:
+        duration_ms = int((time_module.perf_counter() - start_time) * 1000)
         logger.exception("Erro ao executar consulta")
+        log_execution(
+            id=execution_id,
+            started_at=started_at,
+            finished_at=_utc_now_iso(),
+            duration_ms=duration_ms,
+            status="error",
+            database_name=database_name,
+            schema_name=schema_name,
+            object_name=object_name,
+            route=str(request.url.path),
+            method=request.method,
+            client_host=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            limit_value=applied_limit,
+            offset_value=offset,
+            row_count=0,
+            filters_json=json.dumps(filters, ensure_ascii=False),
+            statement_preview=statement_preview,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
         raise HTTPException(status_code=500, detail=f"Falha ao consultar o banco '{database_name}': {exc}") from exc
 
-    return {
-        "success": True,
-        "database": database_name,
-        "schema": schema_name,
-        "object": object_name,
-        "count": len(rows),
-        "limit": applied_limit,
-        "offset": offset,
-        "data": jsonable_encoder(rows),
-    }
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+
+
+def init_execution_log() -> None:
+    EXECUTION_LOG_DB.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS execution_log (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                database_name TEXT,
+                schema_name TEXT,
+                object_name TEXT,
+                route TEXT,
+                method TEXT,
+                client_host TEXT,
+                user_agent TEXT,
+                limit_value INTEGER,
+                offset_value INTEGER,
+                row_count INTEGER,
+                filters_json TEXT NOT NULL DEFAULT '{}',
+                statement_preview TEXT,
+                error_type TEXT,
+                error_message TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_log_started_at ON execution_log(started_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_log_status ON execution_log(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_log_database ON execution_log(database_name)")
+
+
+def log_execution(**payload: Any) -> str:
+    execution_id = payload.get("id") or str(uuid.uuid4())
+    init_execution_log()
+    columns = [
+        "id", "started_at", "finished_at", "duration_ms", "status", "database_name", "schema_name",
+        "object_name", "route", "method", "client_host", "user_agent", "limit_value", "offset_value",
+        "row_count", "filters_json", "statement_preview", "error_type", "error_message",
+    ]
+    values = [payload.get(column) for column in columns]
+    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
+        conn.execute(
+            f"INSERT INTO execution_log ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            values,
+        )
+    return str(execution_id)
+
+
+def list_execution_logs(
+    *,
+    limit: int = 100,
+    offset: int = 0,
+    database_name: str | None = None,
+    object_name: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    init_execution_log()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if database_name:
+        clauses.append("database_name = ?")
+        params.append(database_name)
+    if object_name:
+        clauses.append("UPPER(object_name) = UPPER(?)")
+        params.append(object_name)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    query = f"SELECT * FROM execution_log {where} ORDER BY started_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
+def get_execution_log(execution_id: str) -> dict[str, Any] | None:
+    init_execution_log()
+    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM execution_log WHERE id = ?", (execution_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def purge_execution_logs() -> int:
+    init_execution_log()
+    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
+        cursor = conn.execute("DELETE FROM execution_log")
+        return int(cursor.rowcount or 0)
 
 
 app_settings, configured_databases = load_settings()
@@ -464,6 +768,65 @@ def get_database_data(
 ) -> dict[str, Any]:
     validate_identifier(database_name, "database")
     return execute_query(database_name, object_name, request, schema, limit, offset)
+
+
+@app.get("/execution-logs")
+def get_execution_logs(
+    request: Request,
+    limit: int = Query(default=100, ge=1),
+    offset: int = Query(default=0, ge=0),
+    database_name: Optional[str] = None,
+    object_name: Optional[str] = None,
+    status: Optional[str] = None,
+) -> dict[str, Any]:
+    logs = list_execution_logs(limit=limit, offset=offset, database_name=database_name, object_name=object_name, status=status)
+    return {"success": True, "count": len(logs), "limit": limit, "offset": offset, "data": logs}
+
+
+@app.get("/execution-logs/{execution_id}")
+def read_execution_log(execution_id: str) -> dict[str, Any]:
+    log = get_execution_log(execution_id)
+    if not log:
+        raise HTTPException(status_code=404, detail="Log de execucao nao encontrado.")
+    return {"success": True, "data": log}
+
+
+@app.post("/execution-logs/purge")
+def purge_logs() -> dict[str, Any]:
+    count = purge_execution_logs()
+    return {"success": True, "deleted_count": count}
+
+
+@app.get("/executions")
+def get_executions(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    database_name: Optional[str] = Query(default=None),
+    object_name: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+) -> dict[str, Any]:
+    rows = list_execution_logs(
+        limit=limit,
+        offset=offset,
+        database_name=database_name,
+        object_name=object_name,
+        status=status,
+    )
+    return {"success": True, "count": len(rows), "limit": limit, "offset": offset, "items": rows}
+
+
+@app.get("/executions/{execution_id}")
+def get_execution(execution_id: str) -> dict[str, Any]:
+    row = get_execution_log(execution_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Execucao nao encontrada.")
+    return {"success": True, "item": row}
+
+
+@app.delete("/executions")
+def delete_executions() -> dict[str, Any]:
+    deleted = purge_execution_logs()
+    return {"success": True, "deleted": deleted}
 
 
 if __name__ == "__main__":

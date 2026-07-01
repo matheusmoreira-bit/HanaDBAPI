@@ -4,6 +4,8 @@ sqlalchemy
 hdbcli
 sqlalchemy-hana
 
+requests
+
 # Drivers opcionais para outros bancos:
 # psycopg[binary]
 # pymysql

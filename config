@@ -6,7 +6,11 @@
     "default_schema": "SBO_ANAGAMING",
     "default_limit": 100,
     "max_limit": 1000,
-    "restart_delay_seconds": 5
+    "restart_delay_seconds": 5,
+    "dynamic_token_secret": "8f3c7b2a9e1d4f6a5b8c0e3d2f1a6c5b9d0e7f4a2b1c6d5e8f9a0b3c2d1e4f7a",
+    "sap_service_layer_url": "https://jyl32uqm9176-sl.s1p-zona-01-4fd9831d6a58.saas.wevy.cloud/b1s/v1",
+    "sap_service_layer_verify_ssl": true,
+    "auth_timeout_seconds": 10
   },
   "databases": {
     "hana_prod": {
@@ -16,7 +20,10 @@
       "port": 30015,
       "username": "DBSAPB1",
       "password": "lKd3b10BO*K1eNA2",
-      "default_schema": "SBO_ANAGAMING"
+      "default_schema": "SBO_ANAGAMING",
+      "schema_aliases": {
+        "open_gaming_sa": "SBO_OPENGAMING"
+      }
     }
   }
 }

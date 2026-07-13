@@ -19,7 +19,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import MetaData, Table, create_engine, inspect, select, text
-from sqlalchemy.exc import NoSuchModuleError, SQLAlchemyError
+from sqlalchemy.exc import NoSuchModuleError, NoSuchTableError, SQLAlchemyError
 
 
 logging.basicConfig(
@@ -68,6 +68,7 @@ class AppSettings:
     sap_service_layer_url: str
     sap_service_layer_verify_ssl: bool
     auth_timeout_seconds: int
+    schema_aliases: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class DatabaseConfig:
     label: str
     default_schema: Optional[str]
     allowed_schemas: list[str]
+    schema_aliases: dict[str, str]
 
 
 def locate_config_file() -> Path:
@@ -121,6 +123,12 @@ def config_bool(value: Any, default: bool = False) -> bool:
     if normalized in {"0", "false", "f", "no", "n", "nao"}:
         return False
     return default
+
+
+def normalize_aliases(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(alias).strip().lower(): str(schema).strip() for alias, schema in value.items() if alias and schema}
 
 
 def build_connection_url(config: dict[str, Any]) -> str:
@@ -187,6 +195,7 @@ def load_settings() -> tuple[AppSettings, dict[str, DatabaseConfig]]:
             config_or_env(api_config, "sap_service_layer_verify_ssl", "SAP_B1_SERVICE_LAYER_VERIFY_SSL", False)
         ),
         auth_timeout_seconds=int(config_or_env(api_config, "auth_timeout_seconds", "HANA_QUERY_AUTH_TIMEOUT_SECONDS", 10)),
+        schema_aliases=normalize_aliases(api_config.get("schema_aliases", {})),
     )
 
     databases: dict[str, DatabaseConfig] = {}
@@ -197,6 +206,7 @@ def load_settings() -> tuple[AppSettings, dict[str, DatabaseConfig]]:
             label=config.get("label", name),
             default_schema=config.get("default_schema"),
             allowed_schemas=[schema.upper() for schema in config.get("allowed_schemas", [])],
+            schema_aliases=normalize_aliases(config.get("schema_aliases", {})),
         )
 
     return settings, databases
@@ -270,6 +280,13 @@ def validate_identifier(value: Optional[str], field_name: str) -> Optional[str]:
     return value
 
 
+def resolve_schema_alias(schema_name: Optional[str], database: DatabaseConfig) -> Optional[str]:
+    if not schema_name:
+        return schema_name
+    key = schema_name.strip().lower()
+    return database.schema_aliases.get(key) or app_settings.schema_aliases.get(key) or schema_name
+
+
 def resolve_schema_and_object_name(raw_object_name: str, schema: Optional[str], database: DatabaseConfig) -> tuple[Optional[str], str]:
     explicit_schema = validate_identifier(schema, "schema")
     if "." in raw_object_name:
@@ -283,6 +300,7 @@ def resolve_schema_and_object_name(raw_object_name: str, schema: Optional[str], 
 
     object_name = validate_identifier(raw_object_name, "object")
     schema_name = explicit_schema or database.default_schema or app_settings.default_schema
+    schema_name = resolve_schema_alias(schema_name, database)
 
     if database.allowed_schemas and schema_name and schema_name.upper() not in database.allowed_schemas:
         raise HTTPException(status_code=403, detail=f"Schema '{schema_name}' nao autorizado para o banco '{database.name}'.")
@@ -316,6 +334,11 @@ def load_table(database_name: str, schema_name: Optional[str], object_name: str)
 
     try:
         return Table(object_name, metadata, schema=schema_name, autoload_with=engine)
+    except NoSuchTableError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Objeto '{object_name}' nao encontrado no schema '{schema_name or '<default>'}.",
+        ) from exc
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=500, detail=f"Falha ao carregar metadados de '{object_name}': {exc}") from exc
 

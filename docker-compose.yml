@@ -1,0 +1,22 @@
+services:
+  hana-api:
+    build: .
+    container_name: hana-api
+    restart: unless-stopped
+    environment:
+      HANA_DB_API_CONFIG: /app/config
+      HANA_DB_API_EXECUTION_LOG_DB: /app/logs/executions.db
+    ports:
+      # Porta 8000 continua com o serviço atual via prompt; Docker publica em 8001.
+      - "8001:8000"
+    volumes:
+      # Mantém o config fora da imagem para não precisar rebuildar ao alterar conexões.
+      - ./config:/app/config:ro
+      # Persiste logs e o SQLite de execuções fora do container.
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

@@ -38,6 +38,8 @@ def build_command() -> list[str]:
         app_settings.host,
         "--port",
         str(app_settings.port),
+        "--workers",
+        str(app_settings.workers),
     ]
 
 

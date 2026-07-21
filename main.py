@@ -5,10 +5,13 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time as time_module
 import uuid
+from collections import defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
@@ -18,6 +21,7 @@ import uvicorn
 import requests
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from sqlalchemy import MetaData, Table, create_engine, inspect, select, text
 from sqlalchemy.exc import NoSuchModuleError, NoSuchTableError, SQLAlchemyError
 
@@ -69,6 +73,17 @@ class AppSettings:
     sap_service_layer_verify_ssl: bool
     auth_timeout_seconds: int
     schema_aliases: dict[str, str]
+    db_pool_size: int
+    db_max_overflow: int
+    db_pool_timeout_seconds: int
+    query_concurrency: int
+    query_queue_size: int
+    query_queue_timeout_seconds: int
+    rate_limit_requests: int
+    rate_limit_window_seconds: int
+    execution_log_retention_days: int
+    execution_log_cleanup_interval_seconds: int
+    workers: int
 
 
 @dataclass(frozen=True)
@@ -186,8 +201,8 @@ def load_settings() -> tuple[AppSettings, dict[str, DatabaseConfig]]:
         port=int(api_config.get("port", 8000)),
         default_database=default_database,
         default_schema=api_config.get("default_schema"),
-        default_limit=int(api_config.get("default_limit", 100)),
-        max_limit=int(api_config.get("max_limit", 1000)),
+        default_limit=int(api_config.get("default_limit", 10000)),
+        max_limit=int(api_config.get("max_limit", 10000)),
         restart_delay_seconds=int(api_config.get("restart_delay_seconds", 5)),
         dynamic_token_secret=str(config_or_env(api_config, "dynamic_token_secret", "HANA_QUERY_DYNAMIC_TOKEN_SECRET", "")),
         sap_service_layer_url=str(config_or_env(api_config, "sap_service_layer_url", "SAP_B1_SERVICE_LAYER_URL", "")),
@@ -196,6 +211,17 @@ def load_settings() -> tuple[AppSettings, dict[str, DatabaseConfig]]:
         ),
         auth_timeout_seconds=int(config_or_env(api_config, "auth_timeout_seconds", "HANA_QUERY_AUTH_TIMEOUT_SECONDS", 10)),
         schema_aliases=normalize_aliases(api_config.get("schema_aliases", {})),
+        db_pool_size=int(config_or_env(api_config, "db_pool_size", "HANA_DB_POOL_SIZE", 4)),
+        db_max_overflow=int(config_or_env(api_config, "db_max_overflow", "HANA_DB_MAX_OVERFLOW", 2)),
+        db_pool_timeout_seconds=int(config_or_env(api_config, "db_pool_timeout_seconds", "HANA_DB_POOL_TIMEOUT_SECONDS", 30)),
+        query_concurrency=int(config_or_env(api_config, "query_concurrency", "HANA_QUERY_CONCURRENCY", 5)),
+        query_queue_size=int(config_or_env(api_config, "query_queue_size", "HANA_QUERY_QUEUE_SIZE", 25)),
+        query_queue_timeout_seconds=int(config_or_env(api_config, "query_queue_timeout_seconds", "HANA_QUERY_QUEUE_TIMEOUT_SECONDS", 30)),
+        rate_limit_requests=int(config_or_env(api_config, "rate_limit_requests", "HANA_RATE_LIMIT_REQUESTS", 0)),
+        rate_limit_window_seconds=int(config_or_env(api_config, "rate_limit_window_seconds", "HANA_RATE_LIMIT_WINDOW_SECONDS", 60)),
+        execution_log_retention_days=int(config_or_env(api_config, "execution_log_retention_days", "HANA_EXECUTION_LOG_RETENTION_DAYS", 30)),
+        execution_log_cleanup_interval_seconds=int(config_or_env(api_config, "execution_log_cleanup_interval_seconds", "HANA_EXECUTION_LOG_CLEANUP_INTERVAL_SECONDS", 3600)),
+        workers=int(config_or_env(api_config, "workers", "HANA_API_WORKERS", 2)),
     )
 
     databases: dict[str, DatabaseConfig] = {}
@@ -233,13 +259,19 @@ class DatabaseRegistry:
             connect_args["check_same_thread"] = False
 
         try:
-            engine = create_engine(
-                database.url,
-                pool_pre_ping=True,
-                pool_recycle=1800,
-                future=True,
-                connect_args=connect_args,
-            )
+            engine_options: dict[str, Any] = {
+                "pool_pre_ping": True,
+                "pool_recycle": 1800,
+                "future": True,
+                "connect_args": connect_args,
+            }
+            if not database.url.startswith("sqlite"):
+                engine_options.update(
+                    pool_size=app_settings.db_pool_size,
+                    max_overflow=app_settings.db_max_overflow,
+                    pool_timeout=app_settings.db_pool_timeout_seconds,
+                )
+            engine = create_engine(database.url, **engine_options)
         except NoSuchModuleError as exc:
             raise RuntimeError(
                 f"O driver SQLAlchemy do banco '{name}' nao esta instalado. URL configurada: {database.url}"
@@ -249,9 +281,11 @@ class DatabaseRegistry:
         return engine
 
     def ping(self, name: str) -> None:
+        database = self.get_database(name)
         engine = self.get_engine(name)
+        ping_statement = "SELECT 1 FROM DUMMY" if database.url.startswith("hana") else "SELECT 1"
         with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
+            connection.execute(text(ping_statement))
 
     def list_databases(self) -> list[dict[str, Any]]:
         result = []
@@ -428,6 +462,81 @@ def validate_query_access(request: Request) -> None:
     validate_sap_session(session_id, route_id=route_id)
 
 
+class QueryAdmissionController:
+    """Fila FIFO limitada para proteger o banco e a memoria do processo."""
+
+    def __init__(self, concurrency: int, queue_size: int, timeout_seconds: int) -> None:
+        self.concurrency = max(1, concurrency)
+        self.queue_size = max(0, queue_size)
+        self.timeout_seconds = max(1, timeout_seconds)
+        self._condition = threading.Condition()
+        self._active = 0
+        self._queue: deque[object] = deque()
+
+    @contextmanager
+    def acquire(self):
+        with self._condition:
+            if self._active < self.concurrency and not self._queue:
+                self._active += 1
+            else:
+                if len(self._queue) >= self.queue_size:
+                    raise HTTPException(status_code=429, detail="Fila de consultas cheia. Tente novamente mais tarde.")
+                ticket = object()
+                self._queue.append(ticket)
+                deadline = time_module.monotonic() + self.timeout_seconds
+                while self._queue[0] is not ticket or self._active >= self.concurrency:
+                    remaining = deadline - time_module.monotonic()
+                    if remaining <= 0:
+                        self._queue.remove(ticket)
+                        self._condition.notify_all()
+                        raise HTTPException(status_code=429, detail="Tempo de espera na fila de consultas excedido.")
+                    self._condition.wait(remaining)
+                self._queue.popleft()
+                self._active += 1
+
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+    def status(self) -> dict[str, int]:
+        with self._condition:
+            return {
+                "active": self._active,
+                "queued": len(self._queue),
+                "concurrency_limit": self.concurrency,
+                "queue_limit": self.queue_size,
+            }
+
+
+class FixedWindowRateLimiter:
+    def __init__(self, request_limit: int, window_seconds: int) -> None:
+        self.request_limit = max(0, request_limit)
+        self.window_seconds = max(1, window_seconds)
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def check(self, client: str) -> None:
+        if self.request_limit == 0:
+            return
+        now = time_module.monotonic()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            history = self._requests[client]
+            while history and history[0] <= cutoff:
+                history.popleft()
+            if len(history) >= self.request_limit:
+                retry_after = max(1, int(history[0] + self.window_seconds - now))
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Limite de requisicoes excedido. Tente novamente em {retry_after}s.",
+                    headers={"Retry-After": str(retry_after)},
+                )
+            history.append(now)
+
+
 def parse_bool(value: str) -> bool:
     normalized = value.strip().lower()
     if normalized in {"1", "true", "t", "yes", "y", "sim"}:
@@ -510,7 +619,7 @@ def execute_query(
         validate_query_access(request)
         database = registry.get_database(database_name)
         schema_name, object_name = resolve_schema_and_object_name(raw_object_name, schema, database)
-        applied_limit = None if limit is None else int(limit)
+        applied_limit = app_settings.default_limit if limit is None else int(limit)
 
         if applied_limit is not None and applied_limit > app_settings.max_limit:
             raise HTTPException(
@@ -639,37 +748,62 @@ def _utc_now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
 
 
+_execution_log_init_lock = threading.Lock()
+_execution_log_initialized = False
+_cleanup_stop_event = threading.Event()
+
+
+def connect_execution_log() -> sqlite3.Connection:
+    connection = sqlite3.connect(EXECUTION_LOG_DB, timeout=10)
+    connection.execute("PRAGMA busy_timeout=10000")
+    return connection
+
+
 def init_execution_log() -> None:
+    global _execution_log_initialized
+    if _execution_log_initialized:
+        return
     EXECUTION_LOG_DB.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS execution_log (
-                id TEXT PRIMARY KEY,
-                started_at TEXT NOT NULL,
-                finished_at TEXT NOT NULL,
-                duration_ms INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                database_name TEXT,
-                schema_name TEXT,
-                object_name TEXT,
-                route TEXT,
-                method TEXT,
-                client_host TEXT,
-                user_agent TEXT,
-                limit_value INTEGER,
-                offset_value INTEGER,
-                row_count INTEGER,
-                filters_json TEXT NOT NULL DEFAULT '{}',
-                statement_preview TEXT,
-                error_type TEXT,
-                error_message TEXT
+    with _execution_log_init_lock:
+        if _execution_log_initialized:
+            return
+        with connect_execution_log() as conn:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise
+                logger.warning("Outro worker esta inicializando o WAL; continuando apos aguardar o banco.")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS execution_log (
+                    id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    database_name TEXT,
+                    schema_name TEXT,
+                    object_name TEXT,
+                    route TEXT,
+                    method TEXT,
+                    client_host TEXT,
+                    user_agent TEXT,
+                    limit_value INTEGER,
+                    offset_value INTEGER,
+                    row_count INTEGER,
+                    filters_json TEXT NOT NULL DEFAULT '{}',
+                    statement_preview TEXT,
+                    error_type TEXT,
+                    error_message TEXT
+                )
+                """
             )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_log_started_at ON execution_log(started_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_log_status ON execution_log(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_log_database ON execution_log(database_name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_log_started_at ON execution_log(started_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_log_status ON execution_log(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_log_database ON execution_log(database_name)")
+        _execution_log_initialized = True
 
 
 def log_execution(**payload: Any) -> str:
@@ -681,7 +815,7 @@ def log_execution(**payload: Any) -> str:
         "row_count", "filters_json", "statement_preview", "error_type", "error_message",
     ]
     values = [payload.get(column) for column in columns]
-    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
+    with connect_execution_log() as conn:
         conn.execute(
             f"INSERT INTO execution_log ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
             values,
@@ -712,14 +846,14 @@ def list_execution_logs(
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     query = f"SELECT * FROM execution_log {where} ORDER BY started_at DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
-    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
+    with connect_execution_log() as conn:
         conn.row_factory = sqlite3.Row
         return [dict(row) for row in conn.execute(query, params).fetchall()]
 
 
 def get_execution_log(execution_id: str) -> dict[str, Any] | None:
     init_execution_log()
-    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
+    with connect_execution_log() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM execution_log WHERE id = ?", (execution_id,)).fetchone()
         return dict(row) if row else None
@@ -727,18 +861,66 @@ def get_execution_log(execution_id: str) -> dict[str, Any] | None:
 
 def purge_execution_logs() -> int:
     init_execution_log()
-    with sqlite3.connect(EXECUTION_LOG_DB) as conn:
+    with connect_execution_log() as conn:
         cursor = conn.execute("DELETE FROM execution_log")
         return int(cursor.rowcount or 0)
 
 
+def cleanup_old_execution_logs() -> int:
+    init_execution_log()
+    cutoff = (datetime.utcnow() - timedelta(days=app_settings.execution_log_retention_days)).isoformat(timespec="milliseconds") + "Z"
+    with connect_execution_log() as conn:
+        conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute("DELETE FROM execution_log WHERE started_at < ?", (cutoff,))
+            deleted = int(cursor.rowcount or 0)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    if deleted:
+        logger.info("Limpeza de auditoria removeu %s registros anteriores a %s.", deleted, cutoff)
+    return deleted
+
+
+def execution_log_cleanup_loop() -> None:
+    while not _cleanup_stop_event.is_set():
+        try:
+            cleanup_old_execution_logs()
+        except Exception:
+            logger.exception("Falha na limpeza periodica do log de auditoria.")
+        _cleanup_stop_event.wait(app_settings.execution_log_cleanup_interval_seconds)
+
+
 app_settings, configured_databases = load_settings()
 registry = DatabaseRegistry(configured_databases)
+query_admission = QueryAdmissionController(
+    app_settings.query_concurrency,
+    app_settings.query_queue_size,
+    app_settings.query_queue_timeout_seconds,
+)
+query_rate_limiter = FixedWindowRateLimiter(
+    app_settings.rate_limit_requests,
+    app_settings.rate_limit_window_seconds,
+)
 app = FastAPI(title="Universal Database Gateway", version="2.0.0")
 
 
+@app.on_event("startup")
+def startup_tasks() -> None:
+    init_execution_log()
+    _cleanup_stop_event.clear()
+    threading.Thread(target=execution_log_cleanup_loop, name="execution-log-cleanup", daemon=True).start()
+
+
+@app.on_event("shutdown")
+def shutdown_tasks() -> None:
+    _cleanup_stop_event.set()
+
+
 @app.get("/health")
-def healthcheck(deep: bool = Query(default=False)) -> dict[str, Any]:
+def healthcheck(deep: bool = Query(default=False)) -> Any:
     statuses = []
     overall_status = "ok"
 
@@ -754,11 +936,29 @@ def healthcheck(deep: bool = Query(default=False)) -> dict[str, Any]:
                 overall_status = "degraded"
         statuses.append(status)
 
-    return {
+    payload = {
         "status": overall_status,
         "default_database": app_settings.default_database,
         "databases": statuses,
+        "query_capacity": query_admission.status(),
     }
+    if overall_status != "ok":
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
+def execute_admitted_query(
+    database_name: str,
+    object_name: str,
+    request: Request,
+    schema: Optional[str],
+    limit: Optional[int],
+    offset: int,
+) -> dict[str, Any]:
+    client = request.client.host if request.client else "unknown"
+    query_rate_limiter.check(client)
+    with query_admission.acquire():
+        return execute_query(database_name, object_name, request, schema, limit, offset)
 
 
 @app.get("/databases")
@@ -777,7 +977,7 @@ def get_default_database_data(
     limit: Optional[int] = Query(default=None, ge=1),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    return execute_query(app_settings.default_database, object_name, request, schema, limit, offset)
+    return execute_admitted_query(app_settings.default_database, object_name, request, schema, limit, offset)
 
 
 @app.get("/data/{database_name}/{object_name}")
@@ -790,7 +990,7 @@ def get_database_data(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     validate_identifier(database_name, "database")
-    return execute_query(database_name, object_name, request, schema, limit, offset)
+    return execute_admitted_query(database_name, object_name, request, schema, limit, offset)
 
 
 @app.get("/execution-logs")

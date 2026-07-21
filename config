@@ -4,13 +4,24 @@
     "port": 8000,
     "default_database": "hana_prod",
     "default_schema": "SBO_ANAGAMING",
-    "default_limit": 100,
-    "max_limit": 1000,
+    "default_limit": 10000,
+    "max_limit": 10000,
     "restart_delay_seconds": 5,
     "dynamic_token_secret": "8f3c7b2a9e1d4f6a5b8c0e3d2f1a6c5b9d0e7f4a2b1c6d5e8f9a0b3c2d1e4f7a",
     "sap_service_layer_url": "https://jyl32uqm9176-sl.s1p-zona-01-4fd9831d6a58.saas.wevy.cloud/b1s/v1",
     "sap_service_layer_verify_ssl": true,
-    "auth_timeout_seconds": 10
+    "auth_timeout_seconds": 10,
+    "workers": 2,
+    "db_pool_size": 4,
+    "db_max_overflow": 2,
+    "db_pool_timeout_seconds": 30,
+    "query_concurrency": 5,
+    "query_queue_size": 25,
+    "query_queue_timeout_seconds": 30,
+    "rate_limit_requests": 0,
+    "rate_limit_window_seconds": 60,
+    "execution_log_retention_days": 30,
+    "execution_log_cleanup_interval_seconds": 3600
   },
   "databases": {
     "hana_prod": {

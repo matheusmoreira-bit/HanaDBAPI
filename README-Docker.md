@@ -4,6 +4,17 @@ Preparação Docker para o `Hana API`.
 
 > A versão em produção via prompt/PowerShell pode continuar na porta `8000`. O Docker publica a API em `8001` para rodar em paralelo sem conflito.
 
+## Capacidade e protecoes
+
+- 2 workers Uvicorn e ate 10 consultas simultaneas no total.
+- Fila de 25 consultas por worker, com espera maxima de 30 segundos.
+- Pool HANA de 4 conexoes fixas + 2 excedentes por worker; uma conexao fica de margem para o health check.
+- Rate limit desativado.
+- `limit=10000` por padrao e maximo de 10000 registros por consulta.
+- Auditoria SQLite em modo WAL, com retencao de 30 dias e limpeza horaria.
+- Container sem limites especificos de CPU, memoria ou processos/threads.
+- Health check profundo, incluindo a conexao com o HANA.
+
 ## Porta
 
 - Host Docker: `8001`

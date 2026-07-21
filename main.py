@@ -1,8 +1,10 @@
+import asyncio
 import json
 import hashlib
 import hmac
 import logging
 import os
+import queue
 import re
 import sqlite3
 import threading
@@ -23,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sqlalchemy import MetaData, Table, create_engine, inspect, select, text
+from sqlalchemy import event
 from sqlalchemy.exc import NoSuchModuleError, NoSuchTableError, SQLAlchemyError
 
 
@@ -84,6 +87,22 @@ class AppSettings:
     execution_log_retention_days: int
     execution_log_cleanup_interval_seconds: int
     workers: int
+    metadata_cache_ttl_seconds: int
+    sap_session_cache_ttl_seconds: int
+    sap_connect_timeout_seconds: int
+    sap_read_timeout_seconds: int
+    sap_circuit_failure_threshold: int
+    sap_circuit_recovery_seconds: int
+    sap_validation_max_attempts: int
+    sap_retry_backoff_ms: int
+    hana_connect_timeout_seconds: int
+    hana_communication_timeout_seconds: int
+    hana_query_timeout_seconds: int
+    slow_query_threshold_ms: int
+    audit_queue_size: int
+    audit_batch_size: int
+    audit_flush_interval_seconds: float
+    sap_session_validation_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -222,6 +241,25 @@ def load_settings() -> tuple[AppSettings, dict[str, DatabaseConfig]]:
         execution_log_retention_days=int(config_or_env(api_config, "execution_log_retention_days", "HANA_EXECUTION_LOG_RETENTION_DAYS", 30)),
         execution_log_cleanup_interval_seconds=int(config_or_env(api_config, "execution_log_cleanup_interval_seconds", "HANA_EXECUTION_LOG_CLEANUP_INTERVAL_SECONDS", 3600)),
         workers=int(config_or_env(api_config, "workers", "HANA_API_WORKERS", 2)),
+        metadata_cache_ttl_seconds=int(config_or_env(api_config, "metadata_cache_ttl_seconds", "HANA_METADATA_CACHE_TTL_SECONDS", 300)),
+        sap_session_cache_ttl_seconds=int(config_or_env(api_config, "sap_session_cache_ttl_seconds", "SAP_SESSION_CACHE_TTL_SECONDS", 30)),
+        sap_connect_timeout_seconds=int(config_or_env(api_config, "sap_connect_timeout_seconds", "SAP_CONNECT_TIMEOUT_SECONDS", 10)),
+        sap_read_timeout_seconds=int(config_or_env(api_config, "sap_read_timeout_seconds", "SAP_READ_TIMEOUT_SECONDS", 30)),
+        sap_circuit_failure_threshold=int(config_or_env(api_config, "sap_circuit_failure_threshold", "SAP_CIRCUIT_FAILURE_THRESHOLD", 10)),
+        sap_circuit_recovery_seconds=int(config_or_env(api_config, "sap_circuit_recovery_seconds", "SAP_CIRCUIT_RECOVERY_SECONDS", 15)),
+        sap_validation_max_attempts=int(config_or_env(api_config, "sap_validation_max_attempts", "SAP_VALIDATION_MAX_ATTEMPTS", 2)),
+        sap_retry_backoff_ms=int(config_or_env(api_config, "sap_retry_backoff_ms", "SAP_RETRY_BACKOFF_MS", 250)),
+        hana_connect_timeout_seconds=int(config_or_env(api_config, "hana_connect_timeout_seconds", "HANA_CONNECT_TIMEOUT_SECONDS", 5)),
+        hana_communication_timeout_seconds=int(config_or_env(api_config, "hana_communication_timeout_seconds", "HANA_COMMUNICATION_TIMEOUT_SECONDS", 35)),
+        hana_query_timeout_seconds=int(config_or_env(api_config, "hana_query_timeout_seconds", "HANA_QUERY_TIMEOUT_SECONDS", 30)),
+        slow_query_threshold_ms=int(config_or_env(api_config, "slow_query_threshold_ms", "HANA_SLOW_QUERY_THRESHOLD_MS", 5000)),
+        audit_queue_size=int(config_or_env(api_config, "audit_queue_size", "HANA_AUDIT_QUEUE_SIZE", 5000)),
+        audit_batch_size=int(config_or_env(api_config, "audit_batch_size", "HANA_AUDIT_BATCH_SIZE", 100)),
+        audit_flush_interval_seconds=float(config_or_env(api_config, "audit_flush_interval_seconds", "HANA_AUDIT_FLUSH_INTERVAL_SECONDS", 0.5)),
+        sap_session_validation_enabled=config_bool(
+            config_or_env(api_config, "sap_session_validation_enabled", "SAP_SESSION_VALIDATION_ENABLED", True),
+            True,
+        ),
     )
 
     databases: dict[str, DatabaseConfig] = {}
@@ -257,6 +295,11 @@ class DatabaseRegistry:
         connect_args = {}
         if database.url.startswith("sqlite"):
             connect_args["check_same_thread"] = False
+        elif database.url.startswith("hana"):
+            connect_args.update(
+                connectTimeout=app_settings.hana_connect_timeout_seconds * 1000,
+                communicationTimeout=app_settings.hana_communication_timeout_seconds * 1000,
+            )
 
         try:
             engine_options: dict[str, Any] = {
@@ -272,6 +315,11 @@ class DatabaseRegistry:
                     pool_timeout=app_settings.db_pool_timeout_seconds,
                 )
             engine = create_engine(database.url, **engine_options)
+            if database.url.startswith("hana"):
+                @event.listens_for(engine, "before_cursor_execute")
+                def set_hana_query_timeout(_conn, cursor, _statement, _parameters, _context, _executemany) -> None:
+                    if hasattr(cursor, "setquerytimeout"):
+                        cursor.setquerytimeout(app_settings.hana_query_timeout_seconds)
         except NoSuchModuleError as exc:
             raise RuntimeError(
                 f"O driver SQLAlchemy do banco '{name}' nao esta instalado. URL configurada: {database.url}"
@@ -343,38 +391,39 @@ def resolve_schema_and_object_name(raw_object_name: str, schema: Optional[str], 
 
 
 def load_table(database_name: str, schema_name: Optional[str], object_name: str) -> Table:
-    engine = registry.get_engine(database_name)
-    metadata = MetaData()
-    inspector = inspect(engine)
+    cache_key = (database_name.lower(), (schema_name or "").upper(), object_name.upper())
 
-    try:
-        available_tables = {name.upper() for name in inspector.get_table_names(schema=schema_name)}
-    except NotImplementedError:
-        available_tables = set()
+    def reflect_table() -> Table:
+        engine = registry.get_engine(database_name)
+        metadata = MetaData()
+        inspector = inspect(engine)
 
-    try:
-        available_views = {name.upper() for name in inspector.get_view_names(schema=schema_name)}
-    except NotImplementedError:
-        available_views = set()
+        try:
+            available_tables = {name.upper() for name in inspector.get_table_names(schema=schema_name)}
+        except NotImplementedError:
+            available_tables = set()
+        try:
+            available_views = {name.upper() for name in inspector.get_view_names(schema=schema_name)}
+        except NotImplementedError:
+            available_views = set()
 
-    target_name = object_name.upper()
-
-    if available_tables or available_views:
-        if target_name not in available_tables and target_name not in available_views:
+        target_name = object_name.upper()
+        if (available_tables or available_views) and target_name not in available_tables and target_name not in available_views:
             raise HTTPException(
                 status_code=404,
                 detail=f"Objeto '{object_name}' nao encontrado no schema '{schema_name or '<default>'}'.",
             )
+        try:
+            return Table(object_name, metadata, schema=schema_name, autoload_with=engine)
+        except NoSuchTableError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Objeto '{object_name}' nao encontrado no schema '{schema_name or '<default>'}.",
+            ) from exc
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=500, detail=f"Falha ao carregar metadados de '{object_name}': {exc}") from exc
 
-    try:
-        return Table(object_name, metadata, schema=schema_name, autoload_with=engine)
-    except NoSuchTableError as exc:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Objeto '{object_name}' nao encontrado no schema '{schema_name or '<default>'}.",
-        ) from exc
-    except SQLAlchemyError as exc:
-        raise HTTPException(status_code=500, detail=f"Falha ao carregar metadados de '{object_name}': {exc}") from exc
+    return metadata_cache.get_or_load(cache_key, reflect_table)
 
 
 def parse_filter_key(raw_key: str) -> tuple[str, str]:
@@ -387,14 +436,110 @@ def parse_filter_key(raw_key: str) -> tuple[str, str]:
     return column_name, operator
 
 
-def get_request_value(request: Request, *names: str) -> Optional[str]:
+class TTLValueCache:
+    def __init__(self, ttl_seconds: int, max_entries: int = 10000) -> None:
+        self.ttl_seconds = max(1, ttl_seconds)
+        self.max_entries = max(1, max_entries)
+        self._values: dict[Any, tuple[float, Any]] = {}
+        self._lock = threading.RLock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: Any) -> Any | None:
+        now = time_module.monotonic()
+        with self._lock:
+            cached = self._values.get(key)
+            if cached and cached[0] > now:
+                self.hits += 1
+                return cached[1]
+            if cached:
+                self._values.pop(key, None)
+            self.misses += 1
+            return None
+
+    def set(self, key: Any, value: Any) -> None:
+        with self._lock:
+            if len(self._values) >= self.max_entries:
+                oldest_key = min(self._values, key=lambda item: self._values[item][0])
+                self._values.pop(oldest_key, None)
+            self._values[key] = (time_module.monotonic() + self.ttl_seconds, value)
+
+    def status(self) -> dict[str, int]:
+        with self._lock:
+            return {"entries": len(self._values), "hits": self.hits, "misses": self.misses}
+
+
+class MetadataCache(TTLValueCache):
+    def get_or_load(self, key: Any, loader) -> Table:
+        cached = self.get(key)
+        if cached is not None:
+            return cached
+        # Serializa misses para impedir varias introspeccoes simultaneas do mesmo objeto.
+        with self._lock:
+            cached = self._values.get(key)
+            if cached and cached[0] > time_module.monotonic():
+                self.hits += 1
+                return cached[1]
+            value = loader()
+            self.set(key, value)
+            return value
+
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int, recovery_seconds: int) -> None:
+        self.failure_threshold = max(1, failure_threshold)
+        self.recovery_seconds = max(1, recovery_seconds)
+        self._failures = 0
+        self._open_until = 0.0
+        self._lock = threading.Lock()
+
+    def before_call(self) -> None:
+        with self._lock:
+            if self._open_until > time_module.monotonic():
+                retry_after = max(1, int(self._open_until - time_module.monotonic()))
+                raise HTTPException(
+                    status_code=503,
+                    detail="Validacao SAP temporariamente indisponivel.",
+                    headers={"Retry-After": str(retry_after)},
+                )
+
+    def success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._open_until = 0.0
+
+    def failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._failures >= self.failure_threshold:
+                self._open_until = time_module.monotonic() + self.recovery_seconds
+                logger.error("Circuit breaker do SAP aberto por %ss.", self.recovery_seconds)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            remaining = max(0, int(self._open_until - time_module.monotonic()))
+            return {"state": "open" if remaining else "closed", "failures": self._failures, "retry_after_seconds": remaining}
+
+
+_sap_http_local = threading.local()
+
+
+def sap_http_session() -> requests.Session:
+    session = getattr(_sap_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _sap_http_local.session = session
+    return session
+
+
+def get_header_value(request: Request, *names: str) -> Optional[str]:
     for name in names:
         value = request.headers.get(name)
         if value:
-            return value
-        value = request.query_params.get(name)
-        if value:
-            return value
+            return value.strip()
     return None
 
 
@@ -432,31 +577,82 @@ def validate_dynamic_token(dynamic_token: Optional[str]) -> None:
 
 
 def validate_sap_session(session_id: Optional[str], route_id: Optional[str] = None) -> None:
+    if not app_settings.sap_session_validation_enabled:
+        metrics.increment("sap_session_validation_bypassed_total")
+        return
     if not session_id:
         raise HTTPException(status_code=401, detail="SessionId nao informado.")
 
-    cookie_parts = [f"B1SESSION={session_id.strip()}"]
+    normalized_session = session_id.strip()
+    cache_key = hashlib.sha256(f"{normalized_session}|{route_id or ''}".encode("utf-8")).hexdigest()
+    if sap_session_cache.get(cache_key):
+        return
+
+    sap_circuit_breaker.before_call()
+    cookie_parts = [f"B1SESSION={normalized_session}"]
     if route_id:
         cookie_parts.append(f"ROUTEID={route_id.strip()}")
 
-    try:
-        response = requests.get(
-            f"{service_layer_base_url()}/Users(10)",
-            headers={"Cookie": "; ".join(cookie_parts)},
-            timeout=app_settings.auth_timeout_seconds,
-            verify=app_settings.sap_service_layer_verify_ssl,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail="Falha ao validar SessionId no SAP.") from exc
+    last_exception: requests.RequestException | None = None
+    for attempt in range(1, app_settings.sap_validation_max_attempts + 1):
+        started = time_module.perf_counter()
+        try:
+            response = sap_http_session().get(
+                f"{service_layer_base_url()}/Users(10)",
+                headers={"Cookie": "; ".join(cookie_parts)},
+                timeout=(app_settings.sap_connect_timeout_seconds, app_settings.sap_read_timeout_seconds),
+                verify=app_settings.sap_service_layer_verify_ssl,
+            )
+        except requests.RequestException as exc:
+            last_exception = exc
+            metrics.increment("sap_validation_transport_errors_total")
+            transient = True
+            status_code = None
+        else:
+            status_code = response.status_code
+            transient = status_code == 429 or status_code >= 500
+            if transient:
+                metrics.increment("sap_validation_transient_responses_total")
+            else:
+                sap_circuit_breaker.success()
+                metrics.increment("sap_validation_success_total" if status_code < 400 else "sap_validation_rejected_total")
+                if status_code >= 400:
+                    raise HTTPException(status_code=401, detail="SessionId invalido ou expirado.")
+                sap_session_cache.set(cache_key, True)
+                return
 
-    if response.status_code >= 400:
-        raise HTTPException(status_code=401, detail="SessionId invalido ou expirado.")
+        elapsed_ms = int((time_module.perf_counter() - started) * 1000)
+        if attempt < app_settings.sap_validation_max_attempts:
+            metrics.increment("sap_validation_retries_total")
+            logger.warning(
+                "Validacao SAP transitoria status=%s tentativa=%s/%s duracao_ms=%s; repetindo.",
+                status_code or type(last_exception).__name__,
+                attempt,
+                app_settings.sap_validation_max_attempts,
+                elapsed_ms,
+            )
+            time_module.sleep((app_settings.sap_retry_backoff_ms * attempt) / 1000)
+
+    sap_circuit_breaker.failure()
+    metrics.increment("sap_validation_failures_total")
+    raise HTTPException(status_code=503, detail="Servico de validacao SAP indisponivel.") from last_exception
 
 
 def validate_query_access(request: Request) -> None:
-    dynamic_token = get_request_value(request, "DynamicToken", "dynamic_token", "dynamictoken")
-    session_id = get_request_value(request, "SessionId", "session_id", "sessionid")
-    route_id = get_request_value(request, "RouteId", "route_id", "routeid")
+    credential_query_names = {"dynamictoken", "dynamic_token", "sessionid", "session_id", "routeid", "route_id"}
+    if any(key.lower() in credential_query_names for key in request.query_params):
+        raise HTTPException(status_code=400, detail="Credenciais na URL nao sao permitidas; envie-as somente em headers.")
+
+    authorization = get_header_value(request, "Authorization")
+    dynamic_token = None
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not value.strip():
+            raise HTTPException(status_code=401, detail="Header Authorization invalido.")
+        dynamic_token = value.strip()
+    dynamic_token = dynamic_token or get_header_value(request, "DynamicToken", "X-Dynamic-Token")
+    session_id = get_header_value(request, "SessionId", "X-SAP-Session-ID")
+    route_id = get_header_value(request, "RouteId", "X-SAP-Route-ID")
 
     validate_dynamic_token(dynamic_token)
     validate_sap_session(session_id, route_id=route_id)
@@ -598,6 +794,48 @@ def build_predicate(column: Any, operator: str, raw_value: str):
     raise HTTPException(status_code=400, detail=f"Operador '{operator}' nao suportado.")
 
 
+class MetricsStore:
+    def __init__(self) -> None:
+        self._values: dict[str, int] = defaultdict(int)
+        self._lock = threading.Lock()
+
+    def increment(self, name: str, value: int = 1) -> None:
+        with self._lock:
+            self._values[name] += value
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._values)
+
+
+class QueryExecutionControl:
+    def __init__(self) -> None:
+        self._raw_connection: Any | None = None
+        self._lock = threading.Lock()
+        self.cancelled = False
+
+    def attach(self, raw_connection: Any) -> None:
+        with self._lock:
+            self._raw_connection = raw_connection
+            already_cancelled = self.cancelled
+        if already_cancelled and hasattr(raw_connection, "cancel"):
+            raw_connection.cancel()
+
+    def detach(self) -> None:
+        with self._lock:
+            self._raw_connection = None
+
+    def cancel(self) -> None:
+        with self._lock:
+            self.cancelled = True
+            raw_connection = self._raw_connection
+        if raw_connection is not None and hasattr(raw_connection, "cancel"):
+            try:
+                raw_connection.cancel()
+            except Exception:
+                logger.exception("Falha ao cancelar consulta HANA apos desconexao do cliente.")
+
+
 def execute_query(
     database_name: str,
     raw_object_name: str,
@@ -605,6 +843,7 @@ def execute_query(
     schema: Optional[str],
     limit: Optional[int],
     offset: int,
+    execution_control: QueryExecutionControl | None = None,
 ) -> dict[str, Any]:
     execution_id = str(uuid.uuid4())
     started_at = _utc_now_iso()
@@ -656,8 +895,24 @@ def execute_query(
             offset,
         )
 
+        query_started = time_module.perf_counter()
         with engine.connect() as connection:
-            rows = connection.execute(statement).mappings().all()
+            raw_connection = connection.connection.driver_connection
+            if execution_control:
+                execution_control.attach(raw_connection)
+            try:
+                rows = connection.execute(statement).mappings().all()
+            finally:
+                if execution_control:
+                    execution_control.detach()
+        query_duration_ms = int((time_module.perf_counter() - query_started) * 1000)
+        metrics.increment("queries_success_total")
+        if query_duration_ms >= app_settings.slow_query_threshold_ms:
+            metrics.increment("queries_slow_total")
+            logger.warning(
+                "ALERTA consulta lenta execution_id=%s banco=%s schema=%s objeto=%s query_ms=%s limite=%s",
+                execution_id, database_name, schema_name or "<default>", object_name, query_duration_ms, applied_limit,
+            )
 
         duration_ms = int((time_module.perf_counter() - start_time) * 1000)
         log_execution(
@@ -719,6 +974,18 @@ def execute_query(
         raise
     except SQLAlchemyError as exc:
         duration_ms = int((time_module.perf_counter() - start_time) * 1000)
+        if execution_control and execution_control.cancelled:
+            metrics.increment("queries_cancelled_total")
+            error_status = 499
+            error_detail = "Consulta cancelada porque o cliente desconectou."
+        elif "timeout" in str(exc).lower():
+            metrics.increment("queries_timeout_total")
+            error_status = 504
+            error_detail = "Tempo limite da consulta HANA excedido."
+        else:
+            metrics.increment("queries_error_total")
+            error_status = 500
+            error_detail = f"Falha ao consultar o banco '{database_name}'."
         logger.exception("Erro ao executar consulta")
         log_execution(
             id=execution_id,
@@ -741,7 +1008,7 @@ def execute_query(
             error_type=type(exc).__name__,
             error_message=str(exc),
         )
-        raise HTTPException(status_code=500, detail=f"Falha ao consultar o banco '{database_name}': {exc}") from exc
+        raise HTTPException(status_code=error_status, detail=error_detail) from exc
 
 
 def _utc_now_iso() -> str:
@@ -806,21 +1073,92 @@ def init_execution_log() -> None:
         _execution_log_initialized = True
 
 
+AUDIT_COLUMNS = [
+    "id", "started_at", "finished_at", "duration_ms", "status", "database_name", "schema_name",
+    "object_name", "route", "method", "client_host", "user_agent", "limit_value", "offset_value",
+    "row_count", "filters_json", "statement_preview", "error_type", "error_message",
+]
+
+
+class AsyncAuditWriter:
+    def __init__(self, max_queue_size: int, batch_size: int, flush_interval_seconds: float) -> None:
+        self.batch_size = max(1, batch_size)
+        self.flush_interval_seconds = max(0.05, flush_interval_seconds)
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=max(1, max_queue_size))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start_lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._start_lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, name="audit-writer", daemon=True)
+            self._thread.start()
+
+    def enqueue(self, payload: dict[str, Any]) -> None:
+        try:
+            self._queue.put_nowait(payload)
+            metrics.increment("audit_enqueued_total")
+        except queue.Full:
+            metrics.increment("audit_dropped_total")
+            logger.error("ALERTA fila de auditoria cheia; registro %s descartado.", payload.get("id"))
+
+    def _write_batch(self, batch: list[dict[str, Any]]) -> None:
+        init_execution_log()
+        placeholders = ", ".join("?" for _ in AUDIT_COLUMNS)
+        values = [[payload.get(column) for column in AUDIT_COLUMNS] for payload in batch]
+        for attempt in range(3):
+            try:
+                with connect_execution_log() as conn:
+                    conn.executemany(
+                        f"INSERT INTO execution_log ({', '.join(AUDIT_COLUMNS)}) VALUES ({placeholders})",
+                        values,
+                    )
+                metrics.increment("audit_written_total", len(batch))
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 2:
+                    raise
+                time_module.sleep(0.1 * (attempt + 1))
+
+    def _run(self) -> None:
+        while not self._stop.is_set() or not self._queue.empty():
+            batch: list[dict[str, Any]] = []
+            try:
+                batch.append(self._queue.get(timeout=self.flush_interval_seconds))
+            except queue.Empty:
+                continue
+            deadline = time_module.monotonic() + self.flush_interval_seconds
+            while len(batch) < self.batch_size and time_module.monotonic() < deadline:
+                try:
+                    batch.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            try:
+                self._write_batch(batch)
+            except Exception:
+                metrics.increment("audit_dropped_total", len(batch))
+                logger.exception("ALERTA falha ao gravar lote de %s registros de auditoria.", len(batch))
+            finally:
+                for _ in batch:
+                    self._queue.task_done()
+
+    def stop(self, timeout: float = 10.0) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=timeout)
+
+    def status(self) -> dict[str, int]:
+        return {"queued": self._queue.qsize(), "capacity": self._queue.maxsize, "batch_size": self.batch_size}
+
+
 def log_execution(**payload: Any) -> str:
-    execution_id = payload.get("id") or str(uuid.uuid4())
-    init_execution_log()
-    columns = [
-        "id", "started_at", "finished_at", "duration_ms", "status", "database_name", "schema_name",
-        "object_name", "route", "method", "client_host", "user_agent", "limit_value", "offset_value",
-        "row_count", "filters_json", "statement_preview", "error_type", "error_message",
-    ]
-    values = [payload.get(column) for column in columns]
-    with connect_execution_log() as conn:
-        conn.execute(
-            f"INSERT INTO execution_log ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
-            values,
-        )
-    return str(execution_id)
+    execution_id = str(payload.get("id") or uuid.uuid4())
+    payload["id"] = execution_id
+    audit_writer.enqueue(payload)
+    return execution_id
 
 
 def list_execution_logs(
@@ -894,6 +1232,18 @@ def execution_log_cleanup_loop() -> None:
 
 
 app_settings, configured_databases = load_settings()
+metrics = MetricsStore()
+metadata_cache = MetadataCache(app_settings.metadata_cache_ttl_seconds)
+sap_session_cache = TTLValueCache(app_settings.sap_session_cache_ttl_seconds)
+sap_circuit_breaker = CircuitBreaker(
+    app_settings.sap_circuit_failure_threshold,
+    app_settings.sap_circuit_recovery_seconds,
+)
+audit_writer = AsyncAuditWriter(
+    app_settings.audit_queue_size,
+    app_settings.audit_batch_size,
+    app_settings.audit_flush_interval_seconds,
+)
 registry = DatabaseRegistry(configured_databases)
 query_admission = QueryAdmissionController(
     app_settings.query_concurrency,
@@ -910,6 +1260,7 @@ app = FastAPI(title="Universal Database Gateway", version="2.0.0")
 @app.on_event("startup")
 def startup_tasks() -> None:
     init_execution_log()
+    audit_writer.start()
     _cleanup_stop_event.clear()
     threading.Thread(target=execution_log_cleanup_loop, name="execution-log-cleanup", daemon=True).start()
 
@@ -917,6 +1268,7 @@ def startup_tasks() -> None:
 @app.on_event("shutdown")
 def shutdown_tasks() -> None:
     _cleanup_stop_event.set()
+    audit_writer.stop()
 
 
 @app.get("/health")
@@ -941,13 +1293,28 @@ def healthcheck(deep: bool = Query(default=False)) -> Any:
         "default_database": app_settings.default_database,
         "databases": statuses,
         "query_capacity": query_admission.status(),
+        "audit_queue": audit_writer.status(),
     }
     if overall_status != "ok":
         return JSONResponse(status_code=503, content=payload)
     return payload
 
 
-def execute_admitted_query(
+@app.get("/metrics")
+def get_metrics() -> dict[str, Any]:
+    return {
+        "worker_pid": os.getpid(),
+        "counters": metrics.snapshot(),
+        "metadata_cache": metadata_cache.status(),
+        "sap_session_cache": sap_session_cache.status(),
+        "sap_circuit_breaker": sap_circuit_breaker.status(),
+        "sap_session_validation_enabled": app_settings.sap_session_validation_enabled,
+        "audit_queue": audit_writer.status(),
+        "query_capacity": query_admission.status(),
+    }
+
+
+async def execute_admitted_query(
     database_name: str,
     object_name: str,
     request: Request,
@@ -957,8 +1324,27 @@ def execute_admitted_query(
 ) -> dict[str, Any]:
     client = request.client.host if request.client else "unknown"
     query_rate_limiter.check(client)
-    with query_admission.acquire():
-        return execute_query(database_name, object_name, request, schema, limit, offset)
+    execution_control = QueryExecutionControl()
+
+    def run_query() -> dict[str, Any]:
+        with query_admission.acquire():
+            if execution_control.cancelled:
+                raise HTTPException(status_code=499, detail="Cliente desconectou antes da execucao da consulta.")
+            return execute_query(database_name, object_name, request, schema, limit, offset, execution_control)
+
+    query_task = asyncio.create_task(asyncio.to_thread(run_query))
+    while True:
+        done, _ = await asyncio.wait({query_task}, timeout=0.25)
+        if done:
+            return await query_task
+        if await request.is_disconnected():
+            metrics.increment("client_disconnects_total")
+            await asyncio.to_thread(execution_control.cancel)
+            try:
+                await query_task
+            except Exception:
+                pass
+            raise HTTPException(status_code=499, detail="Cliente desconectou; consulta cancelada.")
 
 
 @app.get("/databases")
@@ -970,18 +1356,18 @@ def list_databases() -> dict[str, Any]:
 
 
 @app.get("/data/{object_name}")
-def get_default_database_data(
+async def get_default_database_data(
     object_name: str,
     request: Request,
     schema: Optional[str] = None,
     limit: Optional[int] = Query(default=None, ge=1),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    return execute_admitted_query(app_settings.default_database, object_name, request, schema, limit, offset)
+    return await execute_admitted_query(app_settings.default_database, object_name, request, schema, limit, offset)
 
 
 @app.get("/data/{database_name}/{object_name}")
-def get_database_data(
+async def get_database_data(
     database_name: str,
     object_name: str,
     request: Request,
@@ -990,7 +1376,7 @@ def get_database_data(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     validate_identifier(database_name, "database")
-    return execute_admitted_query(database_name, object_name, request, schema, limit, offset)
+    return await execute_admitted_query(database_name, object_name, request, schema, limit, offset)
 
 
 @app.get("/execution-logs")

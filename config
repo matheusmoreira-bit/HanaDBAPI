@@ -21,7 +21,23 @@
     "rate_limit_requests": 0,
     "rate_limit_window_seconds": 60,
     "execution_log_retention_days": 30,
-    "execution_log_cleanup_interval_seconds": 3600
+    "execution_log_cleanup_interval_seconds": 3600,
+    "metadata_cache_ttl_seconds": 300,
+    "sap_session_cache_ttl_seconds": 30,
+    "sap_connect_timeout_seconds": 10,
+    "sap_read_timeout_seconds": 30,
+    "sap_circuit_failure_threshold": 10,
+    "sap_circuit_recovery_seconds": 15,
+    "sap_validation_max_attempts": 2,
+    "sap_retry_backoff_ms": 250,
+    "sap_session_validation_enabled": false,
+    "hana_connect_timeout_seconds": 5,
+    "hana_communication_timeout_seconds": 35,
+    "hana_query_timeout_seconds": 30,
+    "slow_query_threshold_ms": 5000,
+    "audit_queue_size": 5000,
+    "audit_batch_size": 100,
+    "audit_flush_interval_seconds": 0.5
   },
   "databases": {
     "hana_prod": {

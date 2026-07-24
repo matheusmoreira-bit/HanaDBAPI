@@ -22,6 +22,19 @@ Preparação Docker para o `Hana API`.
 - Auditoria assincrona em fila de 5000 itens, gravada em lotes de ate 100.
 - Metricas locais de cada worker disponiveis em `/metrics`; consultas acima de 5 segundos geram alerta no log.
 
+## Filtro por periodo
+
+`DataInicio` e `DataFim` sao opcionais e usam o formato `yyyy-MM-dd`. `CampoData` tambem e opcional. Quando omitido ou vazio, o padrao logico e `Data de criação`; a API procura primeiro essa coluna e depois `Data Lançamento` para compatibilidade entre views.
+
+Valores de `CampoData`: `DataPagamento`, `DataVencimento`, `DataLançamento` ou `DataAtualizaçãoEsboço`. O seletor `DataLançamento` aceita tanto `Data Lançamento` quanto `Data de criação`.
+
+```text
+GET /data/SBO_ANAGAMING.VW_FIN_ANALISE_FLUXO?CampoData=DataVencimento&DataInicio=2025-06-01&DataFim=2025-06-30
+```
+
+O dia de `DataFim` e incluido por completo. Sem esses parametros, a consulta funciona normalmente sem filtro de periodo.
+Valores vazios ou contendo apenas espacos em `DataInicio` e `DataFim` sao ignorados individualmente.
+
 ## Porta
 
 - Host Docker: `8001`

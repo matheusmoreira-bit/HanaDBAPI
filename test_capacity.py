@@ -1,14 +1,107 @@
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlencode
 
 from fastapi import HTTPException, Request
-from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine
+from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, create_engine, select
 
 import main
 
 
 class CapacityTests(unittest.TestCase):
+    def test_empty_date_values_are_ignored(self) -> None:
+        request = Request({
+            "type": "http", "method": "GET", "path": "/data/flow",
+            "query_string": b"CampoData=invalid&DataInicio=&DataFim=%20%20", "headers": [],
+        })
+        original = select(1)
+        result = main.apply_date_range_filters(original, {}, request, {})
+        self.assertIs(result, original)
+
+    def test_empty_start_date_keeps_valid_end_filter(self) -> None:
+        column = Column("Data Lançamento", DateTime)
+        request = Request({
+            "type": "http", "method": "GET", "path": "/data/flow",
+            "query_string": b"DataInicio=&DataFim=2025-06-03", "headers": [],
+        })
+        filters = {}
+        main.apply_date_range_filters(select(1), {column.name.upper(): column}, request, filters)
+        self.assertNotIn("DataInicio", filters)
+        self.assertEqual(filters["DataFim"], ["2025-06-03"])
+        self.assertEqual(filters["CampoData"], ["DataCriacao"])
+
+    def test_date_range_filters_selected_column_and_includes_end_day(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        table = Table(
+            "flow",
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("Data Pagamento", DateTime),
+            Column("Data Vencimento", DateTime),
+        )
+        table.create(engine)
+        with engine.begin() as connection:
+            connection.execute(table.insert(), [
+                {"id": 1, "Data Pagamento": datetime(2025, 6, 2, 23, 59), "Data Vencimento": datetime(2025, 1, 1)},
+                {"id": 2, "Data Pagamento": datetime(2025, 6, 3, 18, 30), "Data Vencimento": datetime(2025, 1, 1)},
+                {"id": 3, "Data Pagamento": datetime(2025, 6, 4, 0, 0), "Data Vencimento": datetime(2025, 1, 1)},
+            ])
+        query = urlencode({
+            "CampoData": "DataPagamento",
+            "DataInicio": "2025-06-02",
+            "DataFim": "2025-06-03",
+        }).encode()
+        request = Request({"type": "http", "method": "GET", "path": "/data/flow", "query_string": query, "headers": []})
+        filters = {}
+        statement = main.apply_date_range_filters(
+            select(table),
+            {column.name.upper(): column for column in table.columns},
+            request,
+            filters,
+        )
+        with engine.connect() as connection:
+            ids = [row.id for row in connection.execute(statement)]
+        self.assertEqual(ids, [1, 2])
+        self.assertEqual(filters["CampoData"], ["DataPagamento"])
+
+    def test_date_range_defaults_to_creation_date_alias(self) -> None:
+        column = Column("Data Lançamento", DateTime)
+        request = Request({
+            "type": "http", "method": "GET", "path": "/data/flow",
+            "query_string": b"DataInicio=2025-06-01", "headers": [],
+        })
+        filters = {}
+        statement = main.apply_date_range_filters(
+            select(1), {column.name.upper(): column}, request, filters,
+        )
+        self.assertIsNotNone(statement)
+        self.assertEqual(filters["CampoData"], ["DataCriacao"])
+
+    def test_posting_date_selector_falls_back_to_creation_date(self) -> None:
+        column = Column("Data de criação", DateTime)
+        query = urlencode({"CampoData": "DataLançamento", "DataInicio": "2025-06-01"}).encode()
+        request = Request({
+            "type": "http", "method": "GET", "path": "/data/flow", "query_string": query, "headers": [],
+        })
+        filters = {}
+        statement = main.apply_date_range_filters(
+            select(1), {column.name.upper(): column}, request, filters,
+        )
+        self.assertIsNotNone(statement)
+        self.assertEqual(filters["CampoData"], ["DataLançamento"])
+
+    def test_date_range_rejects_invalid_date_order(self) -> None:
+        column = Column("Data Pagamento", DateTime)
+        query = urlencode({
+            "CampoData": "DataPagamento", "DataInicio": "2025-06-04", "DataFim": "2025-06-03",
+        }).encode()
+        request = Request({"type": "http", "method": "GET", "path": "/data/flow", "query_string": query, "headers": []})
+        with self.assertRaises(HTTPException) as raised:
+            main.apply_date_range_filters(select(1), {column.name.upper(): column}, request, {})
+        self.assertEqual(raised.exception.status_code, 400)
+
     def test_credentials_in_query_string_are_rejected(self) -> None:
         request = Request({
             "type": "http",

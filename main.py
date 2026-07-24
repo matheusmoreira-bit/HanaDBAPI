@@ -59,6 +59,23 @@ RESERVED_QUERY_PARAMS = {
     "session_id",
     "RouteId",
     "route_id",
+    "CampoData",
+    "DataInicio",
+    "DataFim",
+}
+RESERVED_QUERY_PARAMS_LOWER = {name.lower() for name in RESERVED_QUERY_PARAMS}
+DATE_FIELD_MAP: dict[str, tuple[str, ...]] = {
+    "DataCriacao": (
+        "Data de criação", "Data Criação", "Data Criacao",
+        "Data Lançamento", "Data de Lançamento", "Data Lancamento", "Data de Lancamento",
+    ),
+    "DataPagamento": ("Data Pagamento",),
+    "DataVencimento": ("Data Vencimento", "Data de vencimento"),
+    "DataLançamento": (
+        "Data Lançamento", "Data de Lançamento", "Data Lancamento", "Data de Lancamento",
+        "Data de criação", "Data Criação", "Data Criacao",
+    ),
+    "DataAtualizaçãoEsboço": ("Data Atualização Esboço",),
 }
 
 
@@ -794,6 +811,55 @@ def build_predicate(column: Any, operator: str, raw_value: str):
     raise HTTPException(status_code=400, detail=f"Operador '{operator}' nao suportado.")
 
 
+def parse_date_query(value: str, field_name: str) -> date:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise HTTPException(status_code=400, detail=f"{field_name} deve usar o formato yyyy-MM-dd.")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} contem uma data invalida.") from exc
+
+
+def apply_date_range_filters(
+    statement: Any,
+    column_map: dict[str, Any],
+    request: Request,
+    filters: dict[str, list[str]],
+) -> Any:
+    campo_data = (request.query_params.get("CampoData") or "").strip() or None
+    data_inicio_raw = (request.query_params.get("DataInicio") or "").strip() or None
+    data_fim_raw = (request.query_params.get("DataFim") or "").strip() or None
+
+    if not data_inicio_raw and not data_fim_raw:
+        return statement
+    if (data_inicio_raw or data_fim_raw) and not campo_data:
+        campo_data = "DataCriacao"
+    if not campo_data:
+        return statement
+
+    column_candidates = DATE_FIELD_MAP.get(campo_data)
+    if not column_candidates:
+        allowed = ", ".join(key for key in DATE_FIELD_MAP if key != "DataCriacao")
+        raise HTTPException(status_code=400, detail=f"CampoData invalido. Valores permitidos: {allowed}.")
+    column = next((column_map.get(name.upper()) for name in column_candidates if column_map.get(name.upper()) is not None), None)
+    if column is None:
+        expected = "' ou '".join(column_candidates)
+        raise HTTPException(status_code=400, detail=f"A coluna '{expected}' nao existe no objeto consultado.")
+
+    filters["CampoData"] = [campo_data]
+    data_inicio = parse_date_query(data_inicio_raw, "DataInicio") if data_inicio_raw else None
+    data_fim = parse_date_query(data_fim_raw, "DataFim") if data_fim_raw else None
+    if data_inicio and data_fim and data_inicio > data_fim:
+        raise HTTPException(status_code=400, detail="DataInicio nao pode ser posterior a DataFim.")
+    if data_inicio:
+        filters["DataInicio"] = [data_inicio_raw]
+        statement = statement.where(column >= data_inicio)
+    if data_fim:
+        filters["DataFim"] = [data_fim_raw]
+        statement = statement.where(column < data_fim + timedelta(days=1))
+    return statement
+
+
 class MetricsStore:
     def __init__(self) -> None:
         self._values: dict[str, int] = defaultdict(int)
@@ -872,10 +938,12 @@ def execute_query(
         if applied_limit is not None:
             statement = statement.limit(applied_limit)
 
+        statement = apply_date_range_filters(statement, column_map, request, filters)
+
         for raw_key, raw_value in request.query_params.multi_items():
             if not raw_key:
                 continue
-            if raw_key in RESERVED_QUERY_PARAMS:
+            if raw_key.lower() in RESERVED_QUERY_PARAMS_LOWER:
                 continue
             filters.setdefault(raw_key, []).append(raw_value)
             column_name, operator = parse_filter_key(raw_key)
@@ -1360,6 +1428,9 @@ async def get_default_database_data(
     object_name: str,
     request: Request,
     schema: Optional[str] = None,
+    campo_data: Optional[str] = Query(default=None, alias="CampoData"),
+    data_inicio: Optional[str] = Query(default=None, alias="DataInicio"),
+    data_fim: Optional[str] = Query(default=None, alias="DataFim"),
     limit: Optional[int] = Query(default=None, ge=1),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
@@ -1372,6 +1443,9 @@ async def get_database_data(
     object_name: str,
     request: Request,
     schema: Optional[str] = None,
+    campo_data: Optional[str] = Query(default=None, alias="CampoData"),
+    data_inicio: Optional[str] = Query(default=None, alias="DataInicio"),
+    data_fim: Optional[str] = Query(default=None, alias="DataFim"),
     limit: Optional[int] = Query(default=None, ge=1),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:

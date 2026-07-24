@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time as time_module
+import unicodedata
 import uuid
 from collections import defaultdict, deque
 from contextlib import contextmanager
@@ -77,6 +78,23 @@ DATE_FIELD_MAP: dict[str, tuple[str, ...]] = {
     ),
     "DataAtualizaçãoEsboço": ("Data Atualização Esboço",),
 }
+ERP_FLOW_ANALISE_FLUXO_VIEW = "VW_FIN_ANALISE_FLUXO"
+ERP_FLOW_PENDING_STATUS = "Esboço (Pendente - ERP Flow)"
+DEFAULT_EXTERNAL_APPROVALS_API_URL = "https://ryxlofwbyhkqcvzavbwn.supabase.co/functions/v1/external-approvals-api"
+ERP_FLOW_QUERY_PARAMS = {
+    "company_db",
+    "CompanyDB",
+    "ERPFlowCompanyDB",
+    "erp_flow_company_db",
+    "UserCode",
+    "user_code",
+    "SAPUserCode",
+    "sap_user_code",
+    "ERPFlowUserCode",
+    "erp_flow_user_code",
+    "ApproverUserCode",
+    "approver_user_code",
+}
 
 
 @dataclass(frozen=True)
@@ -120,6 +138,9 @@ class AppSettings:
     audit_batch_size: int
     audit_flush_interval_seconds: float
     sap_session_validation_enabled: bool
+    external_approvals_api_url: str
+    external_approvals_api_key: str
+    external_approvals_timeout_seconds: int
 
 
 @dataclass(frozen=True)
@@ -276,6 +297,18 @@ def load_settings() -> tuple[AppSettings, dict[str, DatabaseConfig]]:
         sap_session_validation_enabled=config_bool(
             config_or_env(api_config, "sap_session_validation_enabled", "SAP_SESSION_VALIDATION_ENABLED", True),
             True,
+        ),
+        external_approvals_api_url=str(
+            config_or_env(
+                api_config,
+                "external_approvals_api_url",
+                "EXTERNAL_APPROVALS_API_URL",
+                DEFAULT_EXTERNAL_APPROVALS_API_URL,
+            )
+        ).strip(),
+        external_approvals_api_key=str(config_or_env(api_config, "external_approvals_api_key", "EXTERNAL_APPROVALS_API_KEY", "")).strip(),
+        external_approvals_timeout_seconds=int(
+            config_or_env(api_config, "external_approvals_timeout_seconds", "EXTERNAL_APPROVALS_TIMEOUT_SECONDS", 30)
         ),
     )
 
@@ -560,6 +593,18 @@ def get_header_value(request: Request, *names: str) -> Optional[str]:
     return None
 
 
+def get_request_value(request: Request, *names: str) -> Optional[str]:
+    """Le headers ou query string para parametros funcionais, nunca para autenticacao."""
+    header_value = get_header_value(request, *names)
+    if header_value:
+        return header_value
+    for name in names:
+        value = request.query_params.get(name)
+        if value:
+            return value.strip()
+    return None
+
+
 def service_layer_base_url() -> str:
     base_url = app_settings.sap_service_layer_url.rstrip("/")
     if not base_url:
@@ -673,6 +718,296 @@ def validate_query_access(request: Request) -> None:
 
     validate_dynamic_token(dynamic_token)
     validate_sap_session(session_id, route_id=route_id)
+
+
+def is_erp_flow_augmented_object(object_name: str) -> bool:
+    return object_name.upper() == ERP_FLOW_ANALISE_FLUXO_VIEW
+
+
+def is_reserved_query_param(raw_key: str, object_name: Optional[str] = None) -> bool:
+    if raw_key in RESERVED_QUERY_PARAMS or raw_key.lower() in {key.lower() for key in RESERVED_QUERY_PARAMS}:
+        return True
+    if object_name and is_erp_flow_augmented_object(object_name):
+        return raw_key in ERP_FLOW_QUERY_PARAMS or raw_key.lower() in {key.lower() for key in ERP_FLOW_QUERY_PARAMS}
+    return False
+
+
+def get_erp_flow_company_db(request: Request, schema_name: Optional[str]) -> str:
+    company_db = get_request_value(
+        request,
+        "ERPFlowCompanyDB",
+        "erp_flow_company_db",
+        "CompanyDB",
+        "company_db",
+        "DB",
+        "db",
+    )
+    return (company_db or schema_name or app_settings.default_schema or "").strip()
+
+
+def get_erp_flow_user_code(request: Request) -> str:
+    user_code = get_request_value(
+        request,
+        "ERPFlowUserCode",
+        "erp_flow_user_code",
+        "SAPUserCode",
+        "sap_user_code",
+        "UserCode",
+        "user_code",
+        "ApproverUserCode",
+        "approver_user_code",
+    )
+    return (user_code or "").strip()
+
+
+def fetch_erp_flow_pending_documents(company_db: str, user_code: str) -> list[dict[str, Any]]:
+    if not app_settings.external_approvals_api_url:
+        raise HTTPException(status_code=503, detail="EXTERNAL_APPROVALS_API_URL nao configurada.")
+    if not app_settings.external_approvals_api_key:
+        raise HTTPException(status_code=503, detail="EXTERNAL_APPROVALS_API_KEY nao configurada.")
+    if not company_db:
+        raise HTTPException(status_code=400, detail="company_db nao informado para consultar aprovacoes do ERP Flow.")
+    if not user_code:
+        raise HTTPException(status_code=400, detail="user_code nao informado para consultar aprovacoes do ERP Flow.")
+
+    try:
+        response = requests.post(
+            app_settings.external_approvals_api_url,
+            headers={
+                "X-API-Key": app_settings.external_approvals_api_key,
+                "Content-Type": "application/json",
+            },
+            json={"op": "list", "company_db": company_db, "user_code": user_code},
+            timeout=app_settings.external_approvals_timeout_seconds,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Falha ao consultar aprovacoes pendentes no ERP Flow.") from exc
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if response.status_code >= 400:
+        error_message = payload.get("error") if isinstance(payload, dict) else None
+        if not error_message:
+            error_message = response.text[:500] or f"HTTP {response.status_code}"
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha ao consultar aprovacoes pendentes no ERP Flow: {error_message}",
+        )
+
+    documents = payload.get("documents", []) if isinstance(payload, dict) else []
+    if not isinstance(documents, list):
+        return []
+    return [document for document in documents if isinstance(document, dict)]
+
+
+def normalize_field_key(value: str) -> str:
+    ascii_value = unicodedata.normalize("NFKD", str(value))
+    ascii_value = "".join(char for char in ascii_value if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]", "", ascii_value.lower())
+
+
+def put_document_value(
+    row: dict[str, Any],
+    columns_by_key: dict[str, str],
+    candidate_names: tuple[str, ...],
+    value: Any,
+) -> None:
+    if value is None:
+        return
+    for candidate in candidate_names:
+        column_name = columns_by_key.get(normalize_field_key(candidate))
+        if column_name:
+            row[column_name] = value
+
+
+def build_erp_flow_approval_row(document: dict[str, Any], table: Table) -> dict[str, Any]:
+    row = {column.name: None for column in table.columns}
+    columns_by_key = {normalize_field_key(column.name): column.name for column in table.columns}
+
+    status_column = columns_by_key.get(normalize_field_key("Status"))
+    if status_column:
+        row[status_column] = ERP_FLOW_PENDING_STATUS
+    row["Status"] = ERP_FLOW_PENDING_STATUS
+
+    put_document_value(row, columns_by_key, ("Origem", "Source", "Fonte", "SistemaOrigem"), "ERP Flow")
+    put_document_value(row, columns_by_key, ("ApprovalRequestId", "ERPFlowApprovalRequestId", "IdAprovacao", "AprovacaoId"), document.get("approval_request_id"))
+    put_document_value(row, columns_by_key, ("Step", "ApprovalStep", "ERPFlowStep", "Etapa", "Passo"), document.get("step"))
+    put_document_value(row, columns_by_key, ("ObjType", "ObjectType", "DocObjectType", "TipoObjeto"), document.get("doc_object_type"))
+    put_document_value(row, columns_by_key, ("TipoDocumento", "DocTypeName", "DocumentoTipo", "Documento", "Tipo"), document.get("doc_type_name"))
+    put_document_value(row, columns_by_key, ("DocEntry", "DocumentoEntry", "EntradaDocumento"), document.get("doc_entry"))
+    put_document_value(row, columns_by_key, ("DocNum", "DocumentoNumero", "NumeroDocumento", "NumDocumento", "Numero"), document.get("doc_num"))
+    put_document_value(row, columns_by_key, ("DocTotal", "TotalDocumento", "ValorDocumento", "ValorTotal", "Total", "Valor"), document.get("doc_total"))
+    put_document_value(row, columns_by_key, ("Currency", "Moeda", "DocCurrency", "DocCurr"), document.get("currency"))
+    put_document_value(row, columns_by_key, ("CardCode", "ParceiroCodigo", "CodigoParceiro", "FornecedorCodigo", "CodigoFornecedor"), document.get("card_code"))
+    put_document_value(row, columns_by_key, ("CardName", "ParceiroNome", "NomeParceiro", "Fornecedor", "FornecedorNome", "NomeFornecedor"), document.get("card_name"))
+    put_document_value(row, columns_by_key, ("Remarks", "Comentarios", "Observacoes", "Observacao", "Obs"), document.get("remarks"))
+    put_document_value(row, columns_by_key, ("CreationDate", "DataCriacao", "DataLancamento", "DocDate", "DataDocumento"), document.get("creation_date"))
+    put_document_value(row, columns_by_key, ("UpdateDate", "DataAtualizacao", "DataAlteracao"), document.get("update_date"))
+    put_document_value(row, columns_by_key, ("OriginatorId", "SolicitanteId", "CriadorId"), document.get("originator_id"))
+    put_document_value(row, columns_by_key, ("ApproverUserCode", "AprovadorUserCode", "UserCode", "UsuarioAprovador"), document.get("approver_user_code"))
+
+    row["ERPFlowApprovalRequestId"] = document.get("approval_request_id")
+    row["ERPFlowStep"] = document.get("step")
+    row["ERPFlowDocObjectType"] = document.get("doc_object_type")
+    row["ERPFlowApproverUserCode"] = document.get("approver_user_code")
+    return row
+
+
+def coerce_row_value(column: Any, value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        python_type = column.type.python_type
+    except (AttributeError, NotImplementedError):
+        return value
+
+    if isinstance(value, python_type):
+        return value
+    try:
+        if python_type is str:
+            return str(value)
+        if python_type is bool:
+            return parse_bool(str(value))
+        if python_type is int:
+            return int(value)
+        if python_type is float:
+            return float(value)
+        if python_type is Decimal:
+            return Decimal(str(value))
+        if python_type is datetime:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if python_type is date:
+            return date.fromisoformat(str(value)[:10])
+        if python_type is time:
+            return time.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return value
+    return value
+
+
+def sql_like_matches(value: Any, pattern: str, *, case_sensitive: bool) -> bool:
+    regex_parts = []
+    for char in pattern:
+        if char == "%":
+            regex_parts.append(".*")
+        elif char == "_":
+            regex_parts.append(".")
+        else:
+            regex_parts.append(re.escape(char))
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return re.fullmatch("".join(regex_parts), str(value), flags=flags) is not None
+
+
+def row_value_matches_filter(row_value: Any, column: Any, operator: str, raw_value: str) -> bool:
+    if row_value is None:
+        return False
+    if operator == "like":
+        return sql_like_matches(row_value, raw_value, case_sensitive=True)
+    if operator == "ilike":
+        return sql_like_matches(row_value, raw_value, case_sensitive=False)
+    if operator == "contains":
+        return raw_value.lower() in str(row_value).lower()
+    if operator == "startswith":
+        return str(row_value).lower().startswith(raw_value.lower())
+    if operator == "endswith":
+        return str(row_value).lower().endswith(raw_value.lower())
+
+    converted_row_value = coerce_row_value(column, row_value)
+    if operator == "in":
+        values = [convert_value(column, item.strip()) for item in raw_value.split(",") if item.strip()]
+        return converted_row_value in values
+
+    converted_filter_value = convert_value(column, raw_value)
+    if operator == "eq":
+        return converted_row_value == converted_filter_value
+    try:
+        if operator == "gt":
+            return converted_row_value > converted_filter_value
+        if operator == "gte":
+            return converted_row_value >= converted_filter_value
+        if operator == "lt":
+            return converted_row_value < converted_filter_value
+        if operator == "lte":
+            return converted_row_value <= converted_filter_value
+    except TypeError:
+        return False
+    return False
+
+
+def row_matches_date_range_filter(row: dict[str, Any], request: Request, column_map: dict[str, Any]) -> bool:
+    resolved = resolve_date_range_filter(request, column_map)
+    if resolved is None:
+        return True
+    _campo_data, column, data_inicio, data_fim, _inicio_raw, _fim_raw = resolved
+    value = coerce_row_value(column, row.get(column.name))
+    if value is None:
+        return False
+    if isinstance(value, datetime):
+        value_date = value.date()
+    elif isinstance(value, date):
+        value_date = value
+    else:
+        try:
+            value_date = datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+        except ValueError:
+            return False
+    if data_inicio and value_date < data_inicio:
+        return False
+    if data_fim and value_date > data_fim:
+        return False
+    return True
+
+
+def row_matches_request_filters(row: dict[str, Any], request: Request, column_map: dict[str, Any], object_name: str) -> bool:
+    if not row_matches_date_range_filter(row, request, column_map):
+        return False
+    for raw_key, raw_value in request.query_params.multi_items():
+        if not raw_key or is_reserved_query_param(raw_key, object_name):
+            continue
+        column_name, operator = parse_filter_key(raw_key)
+        column = column_map.get(column_name.upper())
+        if column is None:
+            continue
+        if not row_value_matches_filter(row.get(column.name), column, operator, raw_value):
+            return False
+    return True
+
+
+def append_erp_flow_pending_documents(
+    data: list[dict[str, Any]],
+    table: Table,
+    request: Request,
+    schema_name: Optional[str],
+    object_name: str,
+    column_map: dict[str, Any],
+) -> int:
+    if not is_erp_flow_augmented_object(object_name):
+        return 0
+
+    company_db = get_erp_flow_company_db(request, schema_name)
+    user_code = get_erp_flow_user_code(request)
+    # Mantem compatibilidade com clientes existentes: a integracao externa e opt-in
+    # e so e executada quando o consumidor identifica o usuario aprovador.
+    if not user_code:
+        return 0
+    documents = fetch_erp_flow_pending_documents(company_db, user_code)
+    added = 0
+    for document in documents:
+        row = build_erp_flow_approval_row(document, table)
+        if row_matches_request_filters(row, request, column_map, object_name):
+            data.append(row)
+            added += 1
+    logger.info(
+        "ERP Flow retornou %s documentos pendentes para company_db=%s user_code=%s; adicionados=%s",
+        len(documents),
+        company_db,
+        user_code,
+        added,
+    )
+    return added
 
 
 class QueryAdmissionController:
@@ -820,22 +1155,15 @@ def parse_date_query(value: str, field_name: str) -> date:
         raise HTTPException(status_code=400, detail=f"{field_name} contem uma data invalida.") from exc
 
 
-def apply_date_range_filters(
-    statement: Any,
-    column_map: dict[str, Any],
-    request: Request,
-    filters: dict[str, list[str]],
-) -> Any:
+def resolve_date_range_filter(request: Request, column_map: dict[str, Any]) -> tuple[str, Any, date | None, date | None, str | None, str | None] | None:
     campo_data = (request.query_params.get("CampoData") or "").strip() or None
     data_inicio_raw = (request.query_params.get("DataInicio") or "").strip() or None
     data_fim_raw = (request.query_params.get("DataFim") or "").strip() or None
 
     if not data_inicio_raw and not data_fim_raw:
-        return statement
+        return None
     if (data_inicio_raw or data_fim_raw) and not campo_data:
         campo_data = "DataCriacao"
-    if not campo_data:
-        return statement
 
     column_candidates = DATE_FIELD_MAP.get(campo_data)
     if not column_candidates:
@@ -846,11 +1174,24 @@ def apply_date_range_filters(
         expected = "' ou '".join(column_candidates)
         raise HTTPException(status_code=400, detail=f"A coluna '{expected}' nao existe no objeto consultado.")
 
-    filters["CampoData"] = [campo_data]
     data_inicio = parse_date_query(data_inicio_raw, "DataInicio") if data_inicio_raw else None
     data_fim = parse_date_query(data_fim_raw, "DataFim") if data_fim_raw else None
     if data_inicio and data_fim and data_inicio > data_fim:
         raise HTTPException(status_code=400, detail="DataInicio nao pode ser posterior a DataFim.")
+    return campo_data, column, data_inicio, data_fim, data_inicio_raw, data_fim_raw
+
+
+def apply_date_range_filters(
+    statement: Any,
+    column_map: dict[str, Any],
+    request: Request,
+    filters: dict[str, list[str]],
+) -> Any:
+    resolved = resolve_date_range_filter(request, column_map)
+    if resolved is None:
+        return statement
+    campo_data, column, data_inicio, data_fim, data_inicio_raw, data_fim_raw = resolved
+    filters["CampoData"] = [campo_data]
     if data_inicio:
         filters["DataInicio"] = [data_inicio_raw]
         statement = statement.where(column >= data_inicio)
@@ -943,7 +1284,7 @@ def execute_query(
         for raw_key, raw_value in request.query_params.multi_items():
             if not raw_key:
                 continue
-            if raw_key.lower() in RESERVED_QUERY_PARAMS_LOWER:
+            if is_reserved_query_param(raw_key, object_name):
                 continue
             filters.setdefault(raw_key, []).append(raw_value)
             column_name, operator = parse_filter_key(raw_key)
@@ -982,6 +1323,9 @@ def execute_query(
                 execution_id, database_name, schema_name or "<default>", object_name, query_duration_ms, applied_limit,
             )
 
+        data = [dict(row) for row in rows]
+        append_erp_flow_pending_documents(data, table, request, schema_name, object_name, column_map)
+
         duration_ms = int((time_module.perf_counter() - start_time) * 1000)
         log_execution(
             id=execution_id,
@@ -998,7 +1342,7 @@ def execute_query(
             user_agent=request.headers.get("user-agent"),
             limit_value=applied_limit,
             offset_value=offset,
-            row_count=len(rows),
+            row_count=len(data),
             filters_json=json.dumps(filters, ensure_ascii=False),
             statement_preview=statement_preview,
             error_type=None,
@@ -1011,10 +1355,10 @@ def execute_query(
             "database": database_name,
             "schema": schema_name,
             "object": object_name,
-            "count": len(rows),
+            "count": len(data),
             "limit": applied_limit,
             "offset": offset,
-            "data": jsonable_encoder(rows),
+            "data": jsonable_encoder(data),
         }
     except HTTPException as exc:
         duration_ms = int((time_module.perf_counter() - start_time) * 1000)

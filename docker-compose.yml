@@ -6,6 +6,7 @@ services:
     environment:
       HANA_DB_API_CONFIG: /app/config
       HANA_DB_API_EXECUTION_LOG_DB: /app/logs/executions.db
+      EXTERNAL_APPROVALS_API_KEY: ${EXTERNAL_APPROVALS_API_KEY:-}
     ports:
       # Porta 8000 continua com o serviço atual via prompt; Docker publica em 8001.
       - "8001:8000"

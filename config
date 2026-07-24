@@ -37,7 +37,8 @@
     "slow_query_threshold_ms": 5000,
     "audit_queue_size": 5000,
     "audit_batch_size": 100,
-    "audit_flush_interval_seconds": 0.5
+    "audit_flush_interval_seconds": 0.5,
+    "external_approvals_timeout_seconds": 60
   },
   "databases": {
     "hana_prod": {

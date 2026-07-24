@@ -294,6 +294,7 @@ class CapacityTests(unittest.TestCase):
         }
 
         with (
+            patch.object(main, "app_settings", replace(main.app_settings, external_approvals_api_key="configured")),
             patch.object(main, "validate_query_access"),
             patch.object(main, "load_table", return_value=table),
             patch.object(main.registry, "get_database", return_value=database),
@@ -334,6 +335,7 @@ class CapacityTests(unittest.TestCase):
         database = main.registry.get_database(main.app_settings.default_database)
 
         with (
+            patch.object(main, "app_settings", replace(main.app_settings, external_approvals_api_key="configured")),
             patch.object(main, "validate_query_access"),
             patch.object(main, "load_table", return_value=table),
             patch.object(main.registry, "get_database", return_value=database),
@@ -345,18 +347,49 @@ class CapacityTests(unittest.TestCase):
 
         self.assertEqual(result["count"], 0)
 
-    def test_erp_flow_is_skipped_without_user_code(self) -> None:
+    def test_erp_flow_is_skipped_without_api_key(self) -> None:
         request = Request({
             "type": "http", "method": "GET", "path": "/data/VW_FIN_ANALISE_FLUXO",
             "query_string": b"", "headers": [],
         })
         table = Table("VW_FIN_ANALISE_FLUXO", MetaData(), Column("Status", String))
-        with patch.object(main, "fetch_erp_flow_pending_documents") as fetch:
+        settings = replace(main.app_settings, external_approvals_api_key="")
+        with (
+            patch.object(main, "app_settings", settings),
+            patch.object(main, "fetch_erp_flow_pending_documents") as fetch,
+        ):
             added = main.append_erp_flow_pending_documents(
                 [], table, request, "SBO_ANAGAMING", "VW_FIN_ANALISE_FLUXO", {"STATUS": table.c.Status},
             )
         self.assertEqual(added, 0)
         fetch.assert_not_called()
+
+    def test_erp_flow_company_scope_is_used_without_user_code(self) -> None:
+        request = Request({
+            "type": "http", "method": "GET", "path": "/data/VW_FIN_ANALISE_FLUXO",
+            "query_string": b"", "headers": [],
+        })
+        table = Table(
+            "VW_FIN_ANALISE_FLUXO", MetaData(), Column("Status", String), Column("Aprovador", String),
+        )
+        settings = replace(main.app_settings, external_approvals_api_key="configured")
+        document = {
+            "approval_request_id": 10,
+            "pending_approvers": [{"user_id": 112, "user_code": "joao.silva", "step": 1}],
+        }
+        data = []
+        with (
+            patch.object(main, "app_settings", settings),
+            patch.object(main, "fetch_erp_flow_pending_documents", return_value=[document]) as fetch,
+        ):
+            added = main.append_erp_flow_pending_documents(
+                data, table, request, "SBO_ANAGAMING", "VW_FIN_ANALISE_FLUXO",
+                {column.name.upper(): column for column in table.columns},
+            )
+        fetch.assert_called_once_with("SBO_ANAGAMING", None)
+        self.assertEqual(added, 1)
+        self.assertEqual(data[0]["Aprovador"], "joao.silva")
+        self.assertEqual(data[0]["ERPFlowPendingApprovers"][0]["step"], 1)
 
     def test_erp_flow_documents_respect_date_range(self) -> None:
         table = Table(
@@ -376,12 +409,44 @@ class CapacityTests(unittest.TestCase):
         ]
         data = []
         column_map = {column.name.upper(): column for column in table.columns}
-        with patch.object(main, "fetch_erp_flow_pending_documents", return_value=documents):
+        with (
+            patch.object(main, "app_settings", replace(main.app_settings, external_approvals_api_key="configured")),
+            patch.object(main, "fetch_erp_flow_pending_documents", return_value=documents),
+        ):
             added = main.append_erp_flow_pending_documents(
                 data, table, request, "SBO_ANAGAMING", "VW_FIN_ANALISE_FLUXO", column_map,
             )
         self.assertEqual(added, 1)
         self.assertEqual(data[0]["ERPFlowApprovalRequestId"], 1)
+
+    def test_erp_flow_due_date_is_used_by_data_vencimento_filter(self) -> None:
+        table = Table(
+            "VW_FIN_ANALISE_FLUXO", MetaData(),
+            Column("Status", String), Column("Data Vencimento", DateTime),
+        )
+        query = urlencode({
+            "DataInicio": "2026-06-01", "DataFim": "2026-07-30",
+            "CampoData": "DataVencimento",
+        }).encode()
+        request = Request({
+            "type": "http", "method": "GET", "path": "/data/VW_FIN_ANALISE_FLUXO",
+            "query_string": query, "headers": [],
+        })
+        document = {
+            "approval_request_id": 5,
+            "due_date": "2026-07-14T00:00:00Z",
+        }
+        data = []
+        column_map = {column.name.upper(): column for column in table.columns}
+        with (
+            patch.object(main, "app_settings", replace(main.app_settings, external_approvals_api_key="configured")),
+            patch.object(main, "fetch_erp_flow_pending_documents", return_value=[document]),
+        ):
+            added = main.append_erp_flow_pending_documents(
+                data, table, request, "SBO_OPENGAMING", "VW_FIN_ANALISE_FLUXO", column_map,
+            )
+        self.assertEqual(added, 1)
+        self.assertEqual(data[0]["Data Vencimento"], "2026-07-14T00:00:00Z")
 
 
 if __name__ == "__main__":

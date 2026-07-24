@@ -69,6 +69,8 @@ configure a chave externa antes de subir o serviço:
 $env:EXTERNAL_APPROVALS_API_KEY="sua-chave"
 ```
 
+Ao consultar `VW_FIN_ANALISE_FLUXO`, a API inclui automaticamente todas as pendencias da empresa usando o schema como `company_db`. Se `user_code`/`UserCode` for informado, a integracao muda para o escopo daquele aprovador. No escopo da empresa, os aprovadores atuais tambem sao retornados em `ERPFlowPendingApprovers`.
+
 ## Quando for subir via Docker
 
 ```powershell

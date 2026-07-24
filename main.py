@@ -308,7 +308,7 @@ def load_settings() -> tuple[AppSettings, dict[str, DatabaseConfig]]:
         ).strip(),
         external_approvals_api_key=str(config_or_env(api_config, "external_approvals_api_key", "EXTERNAL_APPROVALS_API_KEY", "")).strip(),
         external_approvals_timeout_seconds=int(
-            config_or_env(api_config, "external_approvals_timeout_seconds", "EXTERNAL_APPROVALS_TIMEOUT_SECONDS", 30)
+            config_or_env(api_config, "external_approvals_timeout_seconds", "EXTERNAL_APPROVALS_TIMEOUT_SECONDS", 60)
         ),
     )
 
@@ -760,15 +760,16 @@ def get_erp_flow_user_code(request: Request) -> str:
     return (user_code or "").strip()
 
 
-def fetch_erp_flow_pending_documents(company_db: str, user_code: str) -> list[dict[str, Any]]:
+def fetch_erp_flow_pending_documents(company_db: str, user_code: Optional[str] = None) -> list[dict[str, Any]]:
     if not app_settings.external_approvals_api_url:
         raise HTTPException(status_code=503, detail="EXTERNAL_APPROVALS_API_URL nao configurada.")
     if not app_settings.external_approvals_api_key:
         raise HTTPException(status_code=503, detail="EXTERNAL_APPROVALS_API_KEY nao configurada.")
     if not company_db:
         raise HTTPException(status_code=400, detail="company_db nao informado para consultar aprovacoes do ERP Flow.")
-    if not user_code:
-        raise HTTPException(status_code=400, detail="user_code nao informado para consultar aprovacoes do ERP Flow.")
+    payload: dict[str, Any] = {"op": "list", "company_db": company_db}
+    if user_code:
+        payload["user_code"] = user_code
 
     try:
         response = requests.post(
@@ -777,10 +778,11 @@ def fetch_erp_flow_pending_documents(company_db: str, user_code: str) -> list[di
                 "X-API-Key": app_settings.external_approvals_api_key,
                 "Content-Type": "application/json",
             },
-            json={"op": "list", "company_db": company_db, "user_code": user_code},
+            json=payload,
             timeout=app_settings.external_approvals_timeout_seconds,
         )
     except Exception as exc:
+        logger.warning("Falha de transporte ao consultar ERP Flow: %s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Falha ao consultar aprovacoes pendentes no ERP Flow.") from exc
 
     try:
@@ -843,16 +845,34 @@ def build_erp_flow_approval_row(document: dict[str, Any], table: Table) -> dict[
     put_document_value(row, columns_by_key, ("Currency", "Moeda", "DocCurrency", "DocCurr"), document.get("currency"))
     put_document_value(row, columns_by_key, ("CardCode", "ParceiroCodigo", "CodigoParceiro", "FornecedorCodigo", "CodigoFornecedor"), document.get("card_code"))
     put_document_value(row, columns_by_key, ("CardName", "ParceiroNome", "NomeParceiro", "Fornecedor", "FornecedorNome", "NomeFornecedor"), document.get("card_name"))
-    put_document_value(row, columns_by_key, ("Remarks", "Comentarios", "Observacoes", "Observacao", "Obs"), document.get("remarks"))
-    put_document_value(row, columns_by_key, ("CreationDate", "DataCriacao", "DataLancamento", "DocDate", "DataDocumento"), document.get("creation_date"))
-    put_document_value(row, columns_by_key, ("UpdateDate", "DataAtualizacao", "DataAlteracao"), document.get("update_date"))
+    put_document_value(row, columns_by_key, ("Remarks", "Comentarios", "Observacoes", "Observacao", "Obs", "Descricao"), document.get("remarks"))
+    put_document_value(row, columns_by_key, ("CreationDate", "DataCriacao"), document.get("creation_date"))
+    put_document_value(row, columns_by_key, ("DataLancamento", "DocDate", "DataDocumento"), document.get("doc_date") or document.get("creation_date"))
+    put_document_value(row, columns_by_key, ("UpdateDate", "DataAtualizacao", "DataAlteracao", "DataAtualizacaoEsboco"), document.get("update_date"))
+    put_document_value(row, columns_by_key, ("DueDate", "DataVencimento"), document.get("due_date"))
+    put_document_value(row, columns_by_key, ("PaymentDate", "DataPagamento"), document.get("payment_date"))
+    put_document_value(row, columns_by_key, ("TaxDate", "DataDocumentoFiscal"), document.get("tax_date"))
+    put_document_value(row, columns_by_key, ("CostCenter", "CentroCusto", "CentroDeCusto"), document.get("cost_center"))
+    put_document_value(row, columns_by_key, ("Department", "Departamento"), document.get("department"))
+    put_document_value(row, columns_by_key, ("Project", "Projeto", "MarcaBrand"), document.get("project"))
     put_document_value(row, columns_by_key, ("OriginatorId", "SolicitanteId", "CriadorId"), document.get("originator_id"))
     put_document_value(row, columns_by_key, ("ApproverUserCode", "AprovadorUserCode", "UserCode", "UsuarioAprovador"), document.get("approver_user_code"))
+
+    pending_approvers = document.get("pending_approvers")
+    if isinstance(pending_approvers, list):
+        approver_codes = [
+            str(item.get("user_code")).strip()
+            for item in pending_approvers
+            if isinstance(item, dict) and item.get("user_code")
+        ]
+        if approver_codes:
+            put_document_value(row, columns_by_key, ("Aprovador", "Aprovadores"), ", ".join(approver_codes))
 
     row["ERPFlowApprovalRequestId"] = document.get("approval_request_id")
     row["ERPFlowStep"] = document.get("step")
     row["ERPFlowDocObjectType"] = document.get("doc_object_type")
     row["ERPFlowApproverUserCode"] = document.get("approver_user_code")
+    row["ERPFlowPendingApprovers"] = pending_approvers if isinstance(pending_approvers, list) else []
     return row
 
 
@@ -989,11 +1009,11 @@ def append_erp_flow_pending_documents(
 
     company_db = get_erp_flow_company_db(request, schema_name)
     user_code = get_erp_flow_user_code(request)
-    # Mantem compatibilidade com clientes existentes: a integracao externa e opt-in
-    # e so e executada quando o consumidor identifica o usuario aprovador.
-    if not user_code:
+    # Sem a chave, preserva a consulta HANA existente. Com a chave configurada,
+    # a ausencia de user_code ativa o novo escopo de todas as pendencias da empresa.
+    if not app_settings.external_approvals_api_key:
         return 0
-    documents = fetch_erp_flow_pending_documents(company_db, user_code)
+    documents = fetch_erp_flow_pending_documents(company_db, user_code or None)
     added = 0
     for document in documents:
         row = build_erp_flow_approval_row(document, table)
@@ -1001,9 +1021,10 @@ def append_erp_flow_pending_documents(
             data.append(row)
             added += 1
     logger.info(
-        "ERP Flow retornou %s documentos pendentes para company_db=%s user_code=%s; adicionados=%s",
+        "ERP Flow retornou %s documentos pendentes para company_db=%s escopo=%s user_code=%s; adicionados=%s",
         len(documents),
         company_db,
+        "user" if user_code else "company",
         user_code,
         added,
     )

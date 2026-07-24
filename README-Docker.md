@@ -40,6 +40,15 @@ O SQLite do log de execuções ficará em:
 ./logs/executions.db
 ```
 
+## Integração ERP Flow
+
+Para que a consulta da `VW_FIN_ANALISE_FLUXO` inclua documentos pendentes no ERP Flow,
+configure a chave externa antes de subir o serviço:
+
+```powershell
+$env:EXTERNAL_APPROVALS_API_KEY="sua-chave"
+```
+
 ## Quando for subir via Docker
 
 ```powershell

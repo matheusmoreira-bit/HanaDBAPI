@@ -18,6 +18,7 @@ Preparação Docker para o `Hana API`.
 - Cache de metadados por 5 minutos e cache de validacao SAP por 30 segundos.
 - Validacao SAP com timeout de conexao/leitura de 10/30 segundos, cache de 30 segundos, retry para timeout/429/5xx e circuit breaker.
 - Validacao de Session ID temporariamente desativada por `sap_session_validation_enabled=false`; o token dinamico continua obrigatorio.
+- Documentacao para gerar o token dinamico: `docs/dynamic-token.md`.
 - Timeout HANA de 30 segundos e cancelamento quando o cliente desconecta.
 - Auditoria assincrona em fila de 5000 itens, gravada em lotes de ate 100.
 - Metricas locais de cada worker disponiveis em `/metrics`; consultas acima de 5 segundos geram alerta no log.
